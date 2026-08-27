@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0A0A0F;
+  --color-surface: #111118;
+  --color-surface2: #18181f;
+  --color-surface3: #1e1e26;
+  --color-brd: #1a1a24;
+  --color-brd-subtle: #252530;
+  --color-neon: #00EC97;
+  --color-text: #e4e4e7;
+  --color-text2: #a1a1aa;
+  --color-text3: #52525b;
+  --color-text4: #3f3f46;
+  --color-yellow: #facc15;
+  --color-red: #f43f5e;
+}
+
+@utility bg-bg { background-color: var(--color-bg); }
+@utility bg-surface { background-color: var(--color-surface); }
+@utility bg-surface2 { background-color: var(--color-surface2); }
+@utility bg-surface3 { background-color: var(--color-surface3); }
+@utility bg-neon { background-color: var(--color-neon); }
+@utility text-text { color: var(--color-text); }
+@utility text-text2 { color: var(--color-text2); }
+@utility text-text3 { color: var(--color-text3); }
+@utility text-text4 { color: var(--color-text4); }
+@utility text-neon { color: var(--color-neon); }
+@utility text-yellow { color: var(--color-yellow); }
+@utility text-red { color: var(--color-red); }
+@utility border-brd { border-color: var(--color-brd); }
+@utility border-brd-subtle { border-color: var(--color-brd-subtle); }
+@utility bg-neon-dim { background-color: color-mix(in srgb, var(--color-neon) 8%, transparent); }
+
+@keyframes pulse-skeleton {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+}
+
+@utility animate-pulse-skeleton {
+  animation: pulse-skeleton 1.5s ease-in-out infinite;
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overflow: hidden;
+}
+
+a { color: inherit; text-decoration: none; }
+
+::-webkit-scrollbar { width: 0; }
+
+input, textarea {
+  font-family: inherit;
+}

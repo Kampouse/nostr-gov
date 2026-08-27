@@ -1,0 +1,715 @@
+/**
+ * GovernancePage.tsx — Permissionless treasury creation + multisig governance
+ * 
+ * Creates <name>.<user-account.testnet> sub-accounts with clear-msig deployed.
+ * Also supports viewing existing treasury contracts by contract ID.
+ */
+
+import { useState, useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  CreateAccount,
+  DeployContract,
+  Transfer,
+  FunctionCall,
+} from "@near-js/transactions";
+import { Landmark, Wallet as WalletIcon, ChevronRight, Plus, Clock, Loader2, RefreshCw, Check, ExternalLink, Trash2, Shield, AlertTriangle, Send } from "lucide-react";
+import { useAuth } from "../hooks/useAuth";
+import { useNear } from "../hooks/useNearWallet";
+import {
+  viewFunction,
+  getWallet, getWalletNearBalance, getWalletState,
+  getOwnerNpubs, getGuardianNpub, getEventNonce, getContractVersion,
+  getProposalsPaginated, getSpendStats,
+  getProposalMessage, getOwnerNonce, listWallets,
+  type Wallet, type Proposal, type Intent,
+} from "../lib/near";
+import { schnorrSign, defaultExpiryNs, buildOwnerMessage, buildApprovalEvent, extractEventFields } from "../lib/schnorr";
+import { NEAR_RPC } from "../lib/constants";
+import { LoginScreen } from "../components/LoginScreen";
+
+const STATUS_STYLES: Record<string, string> = {
+  Active: "text-yellow bg-yellow/10 border-yellow/25",
+  Approved: "text-neon bg-neon-dim border-neon/25",
+  Executed: "text-text2 bg-surface2 border-brd",
+  Cancelled: "text-red bg-red/10 border-red/25",
+};
+
+function timeAgo(ts: number): string {
+  const s = Math.floor(Date.now() / 1000) - ts;
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+// LocalStorage for user's treasury list
+function getTreasuries(): string[] {
+  try { return JSON.parse(localStorage.getItem("nostrgov-treasuries") || "[]"); }
+  catch { return []; }
+}
+function saveTreasury(id: string) {
+  const list = getTreasuries();
+  if (!list.includes(id)) { list.push(id); localStorage.setItem("nostrgov-treasuries", JSON.stringify(list)); }
+}
+function removeTreasury(id: string) {
+  const list = getTreasuries().filter(t => t !== id);
+  localStorage.setItem("nostrgov-treasuries", JSON.stringify(list));
+}
+
+const DEPOSIT_NEAR = 7;
+const STORAGE_DEPOSIT = "500000000000000000000000"; // 0.5 NEAR — matches contract's STORAGE_DEPOSIT_YOCTO
+
+// ── Call a change method via the connected NEAR wallet ──
+async function callMethod(
+  wallet: any,
+  contractId: string,
+  methodName: string,
+  args: Record<string, unknown>,
+  opts?: { gas?: bigint; deposit?: bigint },
+): Promise<any> {
+  const tx = await wallet.signAndSendTransaction({
+    receiverId: contractId,
+    actions: [
+      new FunctionCall({
+        methodName,
+        args: new TextEncoder().encode(JSON.stringify(args)),
+        gas: opts?.gas ?? 30_000_000_000_000n,
+        deposit: opts?.deposit ?? 0n,
+      } as any),
+    ],
+  });
+  return tx;
+}
+
+export default function GovernancePage() {
+  const { pubkey, npub, secretKey, readOnly, signEventRaw } = useAuth();
+  const { accountId, wallet } = useNear();
+  const queryClient = useQueryClient();
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState("");
+  const [treasuries, setTreasuries] = useState<string[]>(getTreasuries);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [addContractId, setAddContractId] = useState("");
+  const [newName, setNewName] = useState("");
+  const [newWalletName, setNewWalletName] = useState("");
+  const [creatingWallet, setCreatingWallet] = useState(false);
+  const [walletError, setWalletError] = useState("");
+
+  const createTreasury = useCallback(async () => {
+    if (!accountId || !wallet || !pubkey || !newName.trim()) return;
+    setCreating(true);
+    setError("");
+    try {
+      const wasmRes = await fetch("/clear_msig.wasm");
+      if (!wasmRes.ok) throw new Error("Failed to fetch WASM");
+      const wasmBytes = new Uint8Array(await wasmRes.arrayBuffer());
+
+      const treasuryId = `${newName.trim()}.${accountId}`;
+      const depositYocto = BigInt(DEPOSIT_NEAR) * 10n ** 24n;
+      const initArgs = JSON.stringify({ owner_npubs: [pubkey] });
+
+      const args = new TextEncoder().encode(initArgs);
+      const tx = await wallet.signAndSendTransaction({
+        receiverId: treasuryId,
+        actions: [
+          new CreateAccount() as any,
+          new Transfer({ deposit: depositYocto }) as any,
+          new DeployContract({ code: wasmBytes }) as any,
+          new FunctionCall({ methodName: "new", args, gas: 30_000_000_000_000n, deposit: 0n }) as any,
+        ],
+      });
+
+      saveTreasury(treasuryId);
+      setTreasuries(getTreasuries());
+      setNewName("");
+      queryClient.invalidateQueries({ queryKey: ["treasury"] });
+      alert(`Treasury created: ${treasuryId}\nTx: ${tx.transaction.hash}`);
+    } catch (e: any) {
+      setError(e.message || "Failed to create treasury");
+    } finally {
+      setCreating(false);
+    }
+  }, [accountId, wallet, pubkey, newName, queryClient]);
+
+  const handleAddTreasury = useCallback(() => {
+    if (!addContractId.trim()) return;
+    saveTreasury(addContractId.trim());
+    setTreasuries(getTreasuries());
+    setAddContractId("");
+    setShowAddForm(false);
+    queryClient.invalidateQueries({ queryKey: ["treasury"] });
+  }, [addContractId, queryClient]);
+
+  const createWallet = useCallback(async (contractId: string) => {
+    if (!wallet || !secretKey || !pubkey || !newWalletName.trim()) return;
+    setCreatingWallet(true);
+    setWalletError("");
+    try {
+      const expiresAt = defaultExpiryNs();
+      const nonce = await getOwnerNonce(contractId);
+      const action = `create_wallet:${newWalletName.trim()}`;
+      const message = buildOwnerMessage(action, nonce, expiresAt, contractId);
+      const signature = schnorrSign(message, secretKey);
+
+      await callMethod(wallet, contractId, "create_wallet", {
+        name: newWalletName.trim(),
+        signature,
+        expires_at: expiresAt,
+        nonce,
+      }, { deposit: BigInt(STORAGE_DEPOSIT) });
+
+      setNewWalletName("");
+      queryClient.invalidateQueries({ queryKey: ["treasury"] });
+    } catch (e: any) {
+      setWalletError(e.message || "Failed to create wallet");
+    } finally {
+      setCreatingWallet(false);
+    }
+  }, [wallet, secretKey, pubkey, newWalletName, queryClient]);
+
+  if (!pubkey) return <LoginScreen />;
+
+  const canSign = !!secretKey || !!signEventRaw;
+
+  return (
+    <div className="flex flex-col h-full overflow-y-auto">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-brd shrink-0">
+        <h1 className="text-[18px] font-bold">Governance</h1>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setShowAddForm(!showAddForm)}
+            className="p-2 rounded-[10px] text-text3 hover:text-text hover:bg-surface2 transition-colors"
+            title="Add existing treasury"
+          >
+            <Plus size={14} />
+          </button>
+          <button
+            onClick={() => queryClient.invalidateQueries({ queryKey: ["treasury"] })}
+            className="p-2 rounded-[10px] text-text3 hover:text-text hover:bg-surface2 transition-colors"
+          >
+            <RefreshCw size={14} />
+          </button>
+        </div>
+      </div>
+
+      {/* Create treasury form */}
+      {accountId && (
+        <div className="px-4 py-3 border-b border-brd bg-surface shrink-0">
+          <div className="text-[11px] text-text4 mb-2">Connected: {accountId}</div>
+          <div className="flex gap-2">
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""))}
+              placeholder="treasury-name"
+              className="flex-1 min-w-0 px-3 py-2 rounded-[10px] bg-bg border border-brd text-text text-[13px] placeholder:text-text4 outline-none focus:border-neon/50"
+              maxLength={32}
+            />
+            <button
+              onClick={createTreasury}
+              disabled={creating || newName.length < 2 || !pubkey}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-[10px] text-[12px] font-semibold bg-neon text-bg border-none cursor-pointer hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
+            >
+              {creating ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}
+              Create Treasury
+            </button>
+          </div>
+          {pubkey && (
+            <div className="text-[10px] text-text4 mt-1.5 truncate">
+              Creates {newName || "name"}.{accountId} with your npub as owner · {DEPOSIT_NEAR} Ⓝ deposit
+            </div>
+          )}
+          {error && <div className="text-red text-[11px] mt-1.5">{error}</div>}
+        </div>
+      )}
+
+      {/* Add existing treasury form */}
+      {showAddForm && (
+        <div className="px-4 py-3 border-b border-brd shrink-0">
+          <div className="flex gap-2">
+            <input
+              value={addContractId}
+              onChange={(e) => setAddContractId(e.target.value)}
+              placeholder="contract-id.testnet"
+              className="flex-1 min-w-0 px-3 py-2 rounded-[10px] bg-bg border border-brd text-text text-[13px] placeholder:text-text4 outline-none focus:border-neon/50 font-mono"
+            />
+            <button
+              onClick={handleAddTreasury}
+              disabled={!addContractId.includes(".")}
+              className="px-4 py-2 rounded-[10px] text-[12px] font-semibold bg-surface2 text-text border border-brd cursor-pointer hover:border-neon/50 disabled:opacity-40"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Treasury list */}
+      <div className="p-2">
+        {treasuries.length === 0 ? (
+          <div className="px-4 py-16 text-text3 text-[13px] text-center">
+            <Landmark size={32} className="mx-auto mb-2 opacity-40" />
+            <p>No treasuries yet.</p>
+            <p className="text-text4 text-[11px] mt-1">
+              {accountId
+                ? `Create one from your account (${accountId}).`
+                : "Connect NEAR wallet + Nostr to create a treasury."}
+            </p>
+          </div>
+        ) : (
+          treasuries.map((contractId) => (
+            <TreasuryCard
+              key={contractId}
+              contractId={contractId}
+              isExpanded={expanded === contractId}
+              onToggle={() => setExpanded(expanded === contractId ? null : contractId)}
+              onRemove={() => { removeTreasury(contractId); setTreasuries(getTreasuries()); }}
+              userNpub={pubkey}
+              canSign={canSign}
+              signEventRaw={signEventRaw}
+              secretKey={secretKey}
+              walletObj={wallet}
+              onCreateWallet={async (name: string) => {
+                const expiresAt = defaultExpiryNs();
+                const nonce = await getOwnerNonce(contractId);
+                const action = `create_wallet:${name}`;
+                const message = buildOwnerMessage(action, nonce, expiresAt, contractId);
+                const signature = schnorrSign(message, secretKey!);
+                return callMethod(wallet, contractId, "create_wallet", {
+                  name, signature, expires_at: expiresAt, nonce,
+                }, { deposit: BigInt(STORAGE_DEPOSIT) });
+              }}
+            />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Treasury Card ──
+
+function TreasuryCard({
+  contractId,
+  isExpanded,
+  onToggle,
+  onRemove,
+  userNpub,
+  canSign,
+  secretKey,
+  walletObj,
+  onCreateWallet,
+  signEventRaw,
+}: {
+  contractId: string;
+  isExpanded: boolean;
+  onToggle: () => void;
+  onRemove: () => void;
+  userNpub: string;
+  canSign: boolean;
+  secretKey: Uint8Array | null;
+  walletObj: any;
+  signEventRaw: ((t: { kind: number; content: string; tags: string[][] }) => Promise<any>) | null;
+  onCreateWallet: (name: string) => Promise<any>;
+}) {
+  const queryClient = useQueryClient();
+  const [newWalletName, setNewWalletName] = useState("");
+  const [creatingWallet, setCreatingWallet] = useState(false);
+  const [walletError, setWalletError] = useState("");
+
+  // Contract metadata
+  const { data: meta, isLoading: loadingMeta } = useQuery({
+    queryKey: ["treasury-meta", contractId],
+    queryFn: async () => {
+      const [version, ownerNpubs, walletCount] = await Promise.all([
+        viewFunction(contractId, "get_version", {}),
+        viewFunction(contractId, "get_owner_npubs", {}),
+        viewFunction(contractId, "get_wallet_count", {}),
+      ]);
+      const wallets = await listWallets(contractId, 0, 50);
+      return { version, ownerNpubs, walletCount, walletNames: wallets as string[] };
+    },
+    refetchInterval: 30_000,
+  });
+
+  const isOwner = Boolean(meta?.ownerNpubs?.includes(userNpub));
+  const [expandedWallet, setExpandedWallet] = useState<string | null>(null);
+
+  const handleCreateWallet = async () => {
+    if (!newWalletName.trim()) return;
+    setCreatingWallet(true);
+    setWalletError("");
+    try {
+      await onCreateWallet(newWalletName.trim());
+      setNewWalletName("");
+      queryClient.invalidateQueries({ queryKey: ["treasury"] });
+    } catch (e: any) {
+      setWalletError(e.message || "Failed");
+    } finally {
+      setCreatingWallet(false);
+    }
+  };
+
+  return (
+    <div className="mb-1">
+      <div className="flex items-center gap-1">
+        <button
+          onClick={onToggle}
+          className="flex-1 flex items-center justify-between p-4 border border-brd rounded-[14px] bg-surface cursor-pointer transition-colors hover:border-neon/40 hover:bg-neon-dim/50"
+        >
+          <div className="flex items-center gap-3 text-left">
+            <div className="w-9 h-9 rounded-[10px] bg-surface2 flex items-center justify-center text-text3">
+              <Landmark size={16} />
+            </div>
+            <div>
+              <div className="text-text text-[14px] font-semibold font-mono truncate max-w-[200px]">
+                {contractId.split(".")[0]}
+              </div>
+              <div className="text-text4 text-[11px] mt-0.5 truncate max-w-[240px]">
+                {contractId}{meta ? ` · v${meta.version} · ${meta.walletCount} wallet${meta.walletCount !== 1 ? "s" : ""}` : " · loading…"}
+                {isOwner && " · "}<span className={isOwner ? "text-neon" : ""}>{isOwner ? "Owner" : "Viewer"}</span>
+              </div>
+            </div>
+          </div>
+          <ChevronRight size={16} className={`text-text4 transition-transform ${isExpanded ? "rotate-90" : ""}`} />
+        </button>
+        <button
+          onClick={(e) => { e.stopPropagation(); onRemove(); }}
+          className="p-2 rounded-[10px] text-text4 hover:text-red hover:bg-red/10 transition-colors"
+          title="Remove from list"
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+
+      {isExpanded && (
+        <div className="px-4 pb-3" style={{ animation: "fade-up 0.2s ease-out" }}>
+          {loadingMeta ? (
+            <div className="flex items-center justify-center py-4 gap-2 text-text3 text-[13px]">
+              <Loader2 size={14} className="animate-spin" /> Loading…
+            </div>
+          ) : (
+            <>
+              {/* Create wallet form */}
+              {isOwner && canSign && (
+                <div className="mb-3 p-3 border border-brd rounded-[12px] bg-surface">
+                  <div className="text-[11px] text-text4 mb-2">Create multisig wallet (+0.5 Ⓝ storage)</div>
+                  <div className="flex gap-2">
+                    <input
+                      value={newWalletName}
+                      onChange={(e) => setNewWalletName(e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""))}
+                      placeholder="wallet-name"
+                      className="flex-1 min-w-0 px-3 py-1.5 rounded-[8px] bg-bg border border-brd text-text text-[13px] placeholder:text-text4 outline-none focus:border-neon/50"
+                      maxLength={64}
+                    />
+                    <button
+                      onClick={handleCreateWallet}
+                      disabled={creatingWallet || newWalletName.length < 2}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[8px] text-[11px] font-semibold bg-neon text-bg border-none cursor-pointer hover:brightness-110 disabled:opacity-40"
+                    >
+                      {creatingWallet ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                      Create
+                    </button>
+                  </div>
+                  {walletError && <div className="text-red text-[10px] mt-1.5">{walletError}</div>}
+                </div>
+              )}
+
+              {/* Wallet list */}
+              {(meta?.walletNames?.length ?? 0) === 0 ? (
+                <p className="text-text4 text-[13px] text-center py-4">No wallets yet.</p>
+              ) : (
+                (meta?.walletNames ?? []).map((wName: string) => (
+                  <WalletDetail
+                    key={wName}
+                    contractId={contractId}
+                    walletName={wName}
+                    isExpanded={expandedWallet === wName}
+                    onToggle={() => setExpandedWallet(expandedWallet === wName ? null : wName)}
+                    isOwner={isOwner}
+                    canSign={canSign}
+              signEventRaw={signEventRaw}
+                    userNpub={userNpub}
+                    secretKey={secretKey}
+                    walletObj={walletObj}
+                  />
+                ))
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Wallet Detail ──
+
+function WalletDetail({
+  contractId,
+  walletName,
+  isExpanded,
+  onToggle,
+  isOwner,
+  canSign,
+  userNpub,
+  secretKey,
+  walletObj,
+  signEventRaw,
+}: {
+  contractId: string;
+  walletName: string;
+  isExpanded: boolean;
+  onToggle: () => void;
+  isOwner: boolean;
+  canSign: boolean;
+  userNpub: string;
+  secretKey: Uint8Array | null;
+  walletObj: any;
+  signEventRaw: ((t: { kind: number; content: string; tags: string[][] }) => Promise<any>) | null;
+}) {
+  const queryClient = useQueryClient();
+  const [approvingId, setApprovingId] = useState<number | null>(null);
+  const [executingId, setExecutingId] = useState<number | null>(null);
+  const [actionError, setActionError] = useState("");
+
+  const { data: balance } = useQuery({
+    queryKey: ["wal-bal", contractId, walletName],
+    queryFn: () => getWalletNearBalance(contractId, walletName),
+    enabled: isExpanded,
+  });
+
+  const { data: state } = useQuery({
+    queryKey: ["wal-state", contractId, walletName],
+    queryFn: () => getWalletState(contractId, walletName),
+    enabled: isExpanded,
+  });
+
+  const { data: proposals = [] } = useQuery({
+    queryKey: ["wal-props", contractId, walletName],
+    queryFn: () => getProposalsPaginated(contractId, walletName, 0, 20),
+    enabled: isExpanded,
+  });
+
+  const { data: stats } = useQuery({
+    queryKey: ["wal-stats", contractId, walletName],
+    queryFn: () => getSpendStats(contractId, walletName),
+    enabled: isExpanded,
+  });
+
+  const bal = balance ? (Number(balance) / 1e24).toFixed(3) : "—";
+  const intents: Intent[] = state?.intents ?? [];
+
+  // Find the user's approver_index in each intent's nostr_approvers
+  function findApproverIndex(intent: Intent): number | null {
+    const idx = intent.nostr_approvers.indexOf(userNpub);
+    return idx >= 0 ? idx : null;
+  }
+
+  // Count total approvals (NEAR bitmap + nostr bitmap)
+  function approvalCount(p: Proposal): number {
+    return (p.approval_bitmap ?? 0).toString(2).split("1").length - 1
+      + (p.nostr_approval_bitmap ?? 0).toString(2).split("1").length - 1;
+  }
+
+  const handleApprove = async (proposal: Proposal) => {
+    if ((!secretKey && !signEventRaw) || !walletObj) return;
+    const intent = intents.find((i) => i.index === proposal.intent_index);
+    if (!intent) { setActionError("Intent not found"); return; }
+
+    const approverIndex = findApproverIndex(intent);
+    if (approverIndex === null) { setActionError("Your npub is not in the approver list"); return; }
+
+    setApprovingId(proposal.id);
+    setActionError("");
+    try {
+      const message = await getProposalMessage(contractId, walletName, proposal.id);
+      if (!message) throw new Error("Could not get proposal message");
+
+      if (secretKey) {
+        // nsec path: direct schnorr sign (cheaper)
+        const expiresAt = defaultExpiryNs();
+        const signature = schnorrSign(message, secretKey);
+        await callMethod(walletObj, contractId, "approve", {
+          wallet_name: walletName,
+          proposal_id: proposal.id,
+          approver_index: approverIndex,
+          pubkey_hex: userNpub,
+          signature,
+          expires_at: expiresAt,
+        });
+      } else if (signEventRaw) {
+        // NIP-46 path: sign a kind-37500 event via bunker
+        const evtTemplate = buildApprovalEvent({
+          pubkey: userNpub,
+          proposalMessage: message,
+          contractId,
+          walletName,
+          proposalId: proposal.id,
+        });
+        const signedEvent = await signEventRaw(evtTemplate);
+        const fields = extractEventFields(signedEvent);
+        await callMethod(walletObj, contractId, "approve_with_event", {
+          wallet_name: walletName,
+          proposal_id: proposal.id,
+          approver_index: approverIndex,
+          ...fields,
+        });
+      }
+
+      queryClient.invalidateQueries({ queryKey: ["wal-props"] });
+      queryClient.invalidateQueries({ queryKey: ["wal-state"] });
+    } catch (e: any) {
+      setActionError(e.message || "Approval failed");
+    } finally {
+      setApprovingId(null);
+    }
+  };
+
+  const handleExecute = async (proposal: Proposal) => {
+    if (!secretKey || !walletObj) return;
+
+    setExecutingId(proposal.id);
+    setActionError("");
+    try {
+      const expiresAt = defaultExpiryNs();
+      const nonce = await getOwnerNonce(contractId);
+      const action = `execute:${walletName}:${proposal.id}`;
+      const message = buildOwnerMessage(action, nonce, expiresAt, contractId);
+      const signature = schnorrSign(message, secretKey);
+
+      await callMethod(walletObj, contractId, "execute", {
+        wallet_name: walletName,
+        proposal_id: proposal.id,
+        signature,
+        expires_at: expiresAt,
+        nonce,
+      });
+
+      queryClient.invalidateQueries({ queryKey: ["wal-props"] });
+      queryClient.invalidateQueries({ queryKey: ["wal-state"] });
+      queryClient.invalidateQueries({ queryKey: ["wal-bal"] });
+    } catch (e: any) {
+      setActionError(e.message || "Execution failed");
+    } finally {
+      setExecutingId(null);
+    }
+  };
+
+  return (
+    <div className="mt-2 border border-brd rounded-[12px] bg-surface overflow-hidden">
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center justify-between p-3 cursor-pointer hover:bg-surface2 transition-colors"
+      >
+        <div className="flex items-center gap-2.5">
+          <WalletIcon size={14} className="text-text3" />
+          <span className="text-text text-[13px] font-mono">{walletName}</span>
+          <span className="text-text4 text-[11px]">{bal} Ⓝ · {proposals.length} proposals</span>
+        </div>
+        <ChevronRight size={14} className={`text-text4 transition-transform ${isExpanded ? "rotate-90" : ""}`} />
+      </button>
+
+      {isExpanded && (
+        <div className="px-3 pb-3 border-t border-brd" style={{ animation: "fade-up 0.15s ease-out" }}>
+          {stats && (
+            <div className="flex gap-2 mt-3">
+              <div className="flex-1 p-2 rounded-[8px] bg-surface2 text-center">
+                <div className="text-text4 text-[10px]">Spent</div>
+                <div className="text-text text-[12px] font-semibold mt-0.5">
+                  {stats.total_spent ? `${(Number(stats.total_spent) / 1e24).toFixed(3)}` : "0"} Ⓝ
+                </div>
+              </div>
+              <div className="flex-1 p-2 rounded-[8px] bg-surface2 text-center">
+                <div className="text-text4 text-[10px]">Txns</div>
+                <div className="text-text text-[12px] font-semibold mt-0.5">{stats.tx_count ?? 0}</div>
+              </div>
+              <div className="flex-1 p-2 rounded-[8px] bg-surface2 text-center">
+                <div className="text-text4 text-[10px]">Intents</div>
+                <div className="text-text text-[12px] font-semibold mt-0.5">{intents.length}</div>
+              </div>
+            </div>
+          )}
+
+          {!canSign && isOwner && (
+            <div className="flex items-center gap-1.5 mt-3 px-2 py-2 rounded-[8px] bg-yellow/5 border border-yellow/20 text-yellow text-[11px]">
+              <AlertTriangle size={12} />
+              Connect with nsec or a NIP-46 bunker to approve proposals
+            </div>
+          )}
+
+          {actionError && (
+            <div className="mt-2 px-2 py-1.5 rounded-[8px] bg-red/10 border border-red/20 text-red text-[11px]">
+              {actionError.length > 120 ? actionError.slice(0, 120) + "…" : actionError}
+            </div>
+          )}
+
+          {proposals.length === 0 ? (
+            <p className="text-text4 text-[12px] text-center py-4">No proposals yet.</p>
+          ) : (
+            proposals.map((p: Proposal) => {
+              const intent = intents.find((i) => i.index === p.intent_index);
+              const threshold = intent?.approval_threshold ?? 1;
+              const approvals = approvalCount(p);
+              const myApproverIdx = intent ? findApproverIndex(intent) : null;
+              const alreadyApproved = myApproverIdx !== null && ((p.nostr_approval_bitmap ?? 0) & (1 << myApproverIdx)) !== 0;
+              const isApproved = p.status === "Approved";
+              const isExecuted = p.status === "Executed";
+
+              return (
+                <div key={p.id} className="p-3 border border-brd rounded-[10px] bg-bg mt-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-text text-[12px] font-semibold">#{p.id} · {intent?.name || `Intent #${p.intent_index}`}</span>
+                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${STATUS_STYLES[p.status] || STATUS_STYLES.Active || "text-text3 bg-surface2 border-brd"}`}>
+                      {p.status}
+                    </span>
+                  </div>
+                  <div className="flex justify-between mt-1.5 text-text4 text-[10px]">
+                    <span className="truncate max-w-[60%] font-mono">{p.proposer}</span>
+                    <span className="flex items-center gap-1">
+                      <Check size={10} /> {approvals}/{threshold}
+                    </span>
+                  </div>
+                  <div className="flex justify-between mt-0.5 text-text4 text-[10px]">
+                    <span className="flex items-center gap-1"><Clock size={10} /> {timeAgo(p.proposed_at / 1_000_000_000)}</span>
+                    <span>expires {timeAgo(p.expires_at / 1_000_000_000)}</span>
+                  </div>
+                  {/* Action buttons */}
+                  <div className="flex gap-1.5 mt-2">
+                    {p.status === "Active" && canSign && myApproverIdx !== null && !alreadyApproved && (
+                      <button
+                        onClick={() => handleApprove(p)}
+                        disabled={approvingId === p.id}
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-[8px] text-[11px] font-medium bg-neon text-bg border-none cursor-pointer hover:brightness-110 disabled:opacity-50"
+                      >
+                        {approvingId === p.id ? <Loader2 size={11} className="animate-spin" /> : <Shield size={11} />}
+                        Approve
+                      </button>
+                    )}
+                    {alreadyApproved && !isApproved && !isExecuted && (
+                      <span className="inline-flex items-center gap-1 px-2 py-1.5 text-[10px] text-neon">
+                        <Check size={10} /> You approved
+                      </span>
+                    )}
+                    {isApproved && !isExecuted && isOwner && canSign && (
+                      <button
+                        onClick={() => handleExecute(p)}
+                        disabled={executingId === p.id}
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-[8px] text-[11px] font-medium bg-surface2 text-text border border-brd cursor-pointer hover:border-neon/50 disabled:opacity-50"
+                      >
+                        {executingId === p.id ? <Loader2 size={11} className="animate-spin" /> : <Send size={11} />}
+                        Execute
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
