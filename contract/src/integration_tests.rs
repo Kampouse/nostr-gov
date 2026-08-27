@@ -69,6 +69,13 @@ fn make_wallet(tokens: Vec<&str>) -> Wallet {
         storage_used: 1000,
         allowed_tokens: tokens.iter().map(|t| t.parse().unwrap()).collect(),
         ft_token_count: tokens.len() as u32,
+        call_allowed_receivers: Vec::new(),
+        call_max_deposit: 0,
+        daily_spend_limit: 0,
+        daily_spend_reset_at: 0,
+        daily_spend_used: 0,
+        relayer_fee: 0,
+        allowed_relayers: Vec::new(),
     }
 }
 
@@ -76,7 +83,7 @@ fn make_wallet(tokens: Vec<&str>) -> Wallet {
 // PROPOSAL LIFECYCLE
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_proposal_lifecycle_active_to_approved() {
     let mut p = make_proposal(ProposalStatus::Active, 3);
     assert_eq!(p.status, ProposalStatus::Active);
@@ -95,7 +102,7 @@ fn test_proposal_lifecycle_active_to_approved() {
     assert_eq!(p.status, ProposalStatus::Approved);
 }
 
-// #[test]
+#[test]
 fn test_proposal_lifecycle_active_to_cancelled() {
     let mut p = make_proposal(ProposalStatus::Active, 3);
 
@@ -109,14 +116,14 @@ fn test_proposal_lifecycle_active_to_cancelled() {
     assert_eq!(p.status, ProposalStatus::Cancelled);
 }
 
-// #[test]
+#[test]
 fn test_proposal_cannot_execute_from_active() {
     let p = make_proposal(ProposalStatus::Active, 3);
     assert!(p.status != ProposalStatus::Approved);
     assert!(p.status != ProposalStatus::Executed);
 }
 
-// #[test]
+#[test]
 fn test_proposal_executed_is_terminal() {
     let p = make_proposal(ProposalStatus::Executed, 3);
     assert!(p.status == ProposalStatus::Executed);
@@ -124,7 +131,7 @@ fn test_proposal_executed_is_terminal() {
     assert!(p.status != ProposalStatus::Approved);
 }
 
-// #[test]
+#[test]
 fn test_proposal_cancelled_is_terminal() {
     let p = make_proposal(ProposalStatus::Cancelled, 3);
     assert!(p.status == ProposalStatus::Cancelled);
@@ -136,7 +143,7 @@ fn test_proposal_cancelled_is_terminal() {
 // AMEND PROPOSAL
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_amend_resets_votes() {
     let mut p = make_proposal(ProposalStatus::Active, 3);
     p.set_approval(0);
@@ -153,7 +160,7 @@ fn test_amend_resets_votes() {
     assert!(p.param_values.contains("carol.near"));
 }
 
-// #[test]
+#[test]
 fn test_amend_preserves_proposer() {
     let p = make_proposal(ProposalStatus::Active, 3);
     let proposer = p.proposer.clone();
@@ -165,28 +172,28 @@ fn test_amend_preserves_proposer() {
 // META-INTENTS
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_meta_intent_indices_reserved() {
     assert!(0 < 3); // AddIntent
     assert!(1 < 3); // RemoveIntent
     assert!(2 < 3); // UpdateIntent
 }
 
-// #[test]
+#[test]
 fn test_cannot_remove_meta_intent() {
     for idx in 0u32..3 {
         assert!(idx < 3, "meta-intent removal should be blocked for idx {}", idx);
     }
 }
 
-// #[test]
+#[test]
 fn test_cannot_update_meta_intent() {
     for idx in 0u32..3 {
         assert!(idx < 3, "meta-intent update should be blocked for idx {}", idx);
     }
 }
 
-// #[test]
+#[test]
 fn test_intent_schema_pinning() {
     let intent = make_intent_custom(
         "Transfer NEAR",
@@ -217,14 +224,14 @@ fn test_intent_schema_pinning() {
 // PARAMETER VALIDATION
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_validate_params_u128_as_string() {
     let params = serde_json::json!({"a": "340282366920938463463374607431768211455"});
     let v: u128 = params["a"].as_str().unwrap().parse().unwrap();
     assert_eq!(v, u128::MAX);
 }
 
-// #[test]
+#[test]
 fn test_validate_params_u128_max_value() {
     let params_ok = serde_json::json!({"a": "999"});
     let v: u128 = params_ok["a"].as_str().unwrap().parse().unwrap();
@@ -235,7 +242,7 @@ fn test_validate_params_u128_max_value() {
     assert!(v2 > 1000);
 }
 
-// #[test]
+#[test]
 fn test_validate_params_account_id() {
     let params = serde_json::json!({"recipient": "bob.near"});
     let s = params["recipient"].as_str().unwrap();
@@ -243,13 +250,13 @@ fn test_validate_params_account_id() {
     assert!(parsed.is_ok());
 }
 
-// #[test]
+#[test]
 fn test_validate_params_bool() {
     let params = serde_json::json!({"flag": true});
     assert!(params["flag"].as_bool() == Some(true));
 }
 
-// #[test]
+#[test]
 fn test_validate_params_missing_param() {
     let params = serde_json::json!({"a": 42});
     assert!(params.get("b").is_none());
@@ -259,7 +266,7 @@ fn test_validate_params_missing_param() {
 // MESSAGE BUILDING
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_message_format_propose() {
     let intent = make_intent_custom(
         "Transfer NEAR",
@@ -287,7 +294,7 @@ fn test_message_format_propose() {
     assert!(msg.contains("proposal: 0"));
 }
 
-// #[test]
+#[test]
 fn test_message_format_approve() {
     let intent = make_intent_custom("Transfer NEAR", "transfer {amount}", vec![], vec![], 1, vec![
         ParamDef { name: "amount".to_string(), param_type: ParamType::U128, max_value: None },
@@ -299,7 +306,7 @@ fn test_message_format_approve() {
     assert!(msg.contains("proposal: 5"));
 }
 
-// #[test]
+#[test]
 fn test_message_format_cancel() {
     let intent = make_intent_custom("T", "{x}", vec![], vec![], 1, vec![
         ParamDef { name: "x".to_string(), param_type: ParamType::U64, max_value: None },
@@ -312,7 +319,7 @@ fn test_message_format_cancel() {
     assert!(msg.contains("wallet: w"));
 }
 
-// #[test]
+#[test]
 fn test_message_different_wallets_no_collision() {
     let intent = make_intent_custom("T", "{x}", vec![], vec![], 1, vec![
         ParamDef { name: "x".to_string(), param_type: ParamType::String, max_value: None },
@@ -325,7 +332,7 @@ fn test_message_different_wallets_no_collision() {
     assert_ne!(msg1, msg2);
 }
 
-// #[test]
+#[test]
 fn test_message_different_proposals_no_collision() {
     let intent = make_intent_custom("T", "{x}", vec![], vec![], 1, vec![
         ParamDef { name: "x".to_string(), param_type: ParamType::String, max_value: None },
@@ -338,7 +345,7 @@ fn test_message_different_proposals_no_collision() {
     assert_ne!(msg1, msg2);
 }
 
-// #[test]
+#[test]
 fn test_message_different_actions_no_collision() {
     let intent = make_intent_custom("T", "{x}", vec![], vec![], 1, vec![
         ParamDef { name: "x".to_string(), param_type: ParamType::String, max_value: None },
@@ -355,7 +362,7 @@ fn test_message_different_actions_no_collision() {
 // TEMPLATE RENDERING
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_render_multi_param() {
     let intent = make_intent_custom("T", "send {amount} to {recipient} with memo {memo}", vec![], vec![], 1, vec![
         ParamDef { name: "amount".to_string(), param_type: ParamType::U128, max_value: None },
@@ -372,7 +379,7 @@ fn test_render_multi_param() {
     assert_eq!(rendered, "send 5000 to bob.near with memo payment");
 }
 
-// #[test]
+#[test]
 fn test_render_bool_param() {
     let intent = make_intent_custom("T", "lock: {locked}", vec![], vec![], 1, vec![
         ParamDef { name: "locked".to_string(), param_type: ParamType::Bool, max_value: None },
@@ -386,7 +393,7 @@ fn test_render_bool_param() {
 // DELEGATION
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_delegation_key_format() {
     let key = delegation_key("treasury", 3, 0);
     assert!(key.contains("treasury"));
@@ -399,7 +406,7 @@ fn test_delegation_key_format() {
 // WALLET NAME VALIDATION
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_valid_wallet_names() {
     let valid = vec!["treasury", "my-wallet", "test_123", "ABC", "a"];
     for name in valid {
@@ -409,7 +416,7 @@ fn test_valid_wallet_names() {
     }
 }
 
-// #[test]
+#[test]
 fn test_invalid_wallet_names() {
     assert!("".is_empty());
     let long = "a".repeat(65);
@@ -422,14 +429,14 @@ fn test_invalid_wallet_names() {
 // FT BALANCE TRACKING
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_ft_balance_key_format() {
     let key = ft_balance_key("treasury", "usdt.tether-token.near");
     assert!(key.contains("treasury"));
     assert!(key.contains("usdt"));
 }
 
-// #[test]
+#[test]
 fn test_ft_balance_key_no_collision() {
     let key1 = ft_balance_key("wallet-a", "token.near");
     let key2 = ft_balance_key("wallet-b", "token.near");
@@ -444,21 +451,21 @@ fn test_ft_balance_key_no_collision() {
 // ALLOWLIST LOGIC
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_allowlist_empty_accepts_all() {
     let wallet = make_wallet(vec![]);
     assert!(is_token_allowed(&wallet, &"anything.near".parse().unwrap()));
     assert!(is_token_allowed(&wallet, &"usdt.tether-token.near".parse().unwrap()));
 }
 
-// #[test]
+#[test]
 fn test_allowlist_non_empty_blocks_unlisted() {
     let wallet = make_wallet(vec!["usdt.tether-token.near"]);
     assert!(is_token_allowed(&wallet, &"usdt.tether-token.near".parse().unwrap()));
     assert!(!is_token_allowed(&wallet, &"evil-token.near".parse().unwrap()));
 }
 
-// #[test]
+#[test]
 fn test_allowlist_multiple_tokens() {
     let wallet = make_wallet(vec!["usdt.tether-token.near", "wrap.near"]);
     assert!(is_token_allowed(&wallet, &"usdt.tether-token.near".parse().unwrap()));
@@ -470,14 +477,14 @@ fn test_allowlist_multiple_tokens() {
 // INTENT TYPE & PROPOSER CHECK
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_intent_types_distinct() {
     assert!(IntentType::AddIntent != IntentType::RemoveIntent);
     assert!(IntentType::RemoveIntent != IntentType::UpdateIntent);
     assert!(IntentType::UpdateIntent != IntentType::Custom);
 }
 
-// #[test]
+#[test]
 fn test_intent_proposer_check() {
     let intent = make_intent_custom(
         "Transfer NEAR",
@@ -501,7 +508,7 @@ fn test_intent_proposer_check() {
 // EXECUTION GAS
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_execution_gas_default() {
     let intent = make_intent_custom("T", "{x}", vec![], vec![], 1, vec![
         ParamDef { name: "x".to_string(), param_type: ParamType::U64, max_value: None },
@@ -509,7 +516,7 @@ fn test_execution_gas_default() {
     assert_eq!(intent.execution_gas(), Gas::from_tgas(50));
 }
 
-// #[test]
+#[test]
 fn test_execution_gas_max() {
     let mut intent = make_intent_custom("T", "{x}", vec![], vec![], 1, vec![
         ParamDef { name: "x".to_string(), param_type: ParamType::U64, max_value: None },
@@ -518,7 +525,7 @@ fn test_execution_gas_max() {
     assert!(intent.execution_gas_tgas <= MAX_EXECUTION_GAS_TGAS);
 }
 
-// #[test]
+#[test]
 fn test_execution_gas_clamped() {
     let mut intent = make_intent_custom("T", "{x}", vec![], vec![], 1, vec![
         ParamDef { name: "x".to_string(), param_type: ParamType::U64, max_value: None },
@@ -532,7 +539,7 @@ fn test_execution_gas_clamped() {
 // STORAGE KEY NAMESPACING
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_intent_key_namespace() {
     let k1 = intent_key("treasury", 0);
     let k2 = intent_key("treasury", 1);
@@ -543,7 +550,7 @@ fn test_intent_key_namespace() {
     assert!(k1.contains(":i:"));
 }
 
-// #[test]
+#[test]
 fn test_proposal_key_namespace() {
     let k1 = proposal_key("treasury", 0);
     let k2 = proposal_key("treasury", 1);
@@ -558,7 +565,7 @@ fn test_proposal_key_namespace() {
 // SAFE JSON FT TRANSFER
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_safe_json_ft_transfer_format() {
     let json = safe_json_ft_transfer("bob.near", "1000000");
     let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
@@ -567,7 +574,7 @@ fn test_safe_json_ft_transfer_format() {
     assert_eq!(parsed["msg"], "");
 }
 
-// #[test]
+#[test]
 fn test_safe_json_ft_transfer_large_amount() {
     let amount = "340282366920938463463374607431768211455";
     let json = safe_json_ft_transfer("bob.near", amount);
@@ -579,9 +586,9 @@ fn test_safe_json_ft_transfer_large_amount() {
 // EVENT NONCE
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_event_nonce_starts_at_zero() {
-    let contract = Contract::new("6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3".to_string());
+    let contract = Contract::new(vec!["6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3".to_string()]);
     assert_eq!(contract.get_event_nonce(), 0);
 }
 
@@ -589,22 +596,22 @@ fn test_event_nonce_starts_at_zero() {
 // EDGE CASES & CONSTANTS
 // ══════════════════════════════════════════════════════════════════════════
 
-// #[test]
+#[test]
 fn test_max_proposals_per_intent() {
     assert_eq!(MAX_ACTIVE_PROPOSALS, 100);
 }
 
-// #[test]
+#[test]
 fn test_max_approvers() {
     assert_eq!(MAX_APPROVERS, 64);
 }
 
-// #[test]
+#[test]
 fn test_storage_deposit_amount() {
     assert_eq!(STORAGE_DEPOSIT_YOCTO, 500_000_000_000_000_000_000_000u128);
 }
 
-// #[test]
+#[test]
 fn test_hex_roundtrip_bytes() {
     let bytes: Vec<u8> = (0..32).map(|i| (i * 7 + 13) as u8).collect();
     let encoded = message::hex_encode(&bytes);
@@ -612,7 +619,7 @@ fn test_hex_roundtrip_bytes() {
     assert_eq!(bytes, decoded);
 }
 
-// #[test]
+#[test]
 fn test_hex_empty() {
     let encoded = message::hex_encode(&[]);
     let decoded = message::hex_decode(&encoded);
