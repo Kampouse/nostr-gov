@@ -1,0 +1,18 @@
+name = "nostr-relay-watcher"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+[[durable_objects.bindings]]
+name = "RELAY_WATCHER"
+class_name = "RelayWatcher"
+
+[exports.RelayWatcher]
+type = "durable-object"
+storage = "sqlite"
+
+[vars]
+NEAR_RPC = "https://rpc.testnet.fastnear.com"
+RELAY_URL = "wss://relay.primal.net"
+SUBSCRIPTION_TAG = "nostrgov-benchv5.vault.kampy.testnet"
+NEAR_ACCOUNT_ID = "nostr-watcher.kampy.testnet"
+TREASURY_CONTRACT_ID = "benchv5.vault.kampy.testnet"
