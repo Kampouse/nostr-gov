@@ -35,3 +35,7 @@ export const NEAR_NETWORK_ID = "testnet";
 
 // ── nostr-msig (testnet) ──
 export const DEFAULT_TREASURY = "benchv5.vault.kampy.testnet";
+
+// ── Relayer watcher ──
+export const RELAYER_WATCHER_URL = "https://nostr-relay-watcher.kj95hgdgnn.workers.dev";
+export const RELAYER_RELAYS = ["wss://relay.primal.net", "wss://nos.lol", "wss://relay.damus.io"];

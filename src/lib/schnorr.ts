@@ -56,16 +56,21 @@ export const buildApprovalEvent = (params: {
   contractId: string;
   walletName: string;
   proposalId: number;
+  approverIndex: number;
+  action?: "approve" | "cancel";
 }): NostrEventTemplate => {
-  const { pubkey, proposalMessage, contractId, walletName, proposalId } = params;
+  const { pubkey, proposalMessage, contractId, walletName, proposalId, approverIndex, action } = params;
+  const tags: string[][] = [
+    ["contract", contractId],
+    ["wallet", walletName],
+    ["proposal", String(proposalId)],
+    ["approver", String(approverIndex)],
+  ];
+  if (action) tags.push(["action", action]);
   return {
     kind: 37500,
     content: proposalMessage,
-    tags: [
-      ["contract", contractId],
-      ["wallet", walletName],
-      ["proposal", String(proposalId)],
-    ],
+    tags,
     created_at: Math.floor(Date.now() / 1000),
   };
 };

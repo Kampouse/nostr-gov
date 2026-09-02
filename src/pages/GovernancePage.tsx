@@ -13,7 +13,7 @@ import {
   Transfer,
   FunctionCall,
 } from "@near-js/transactions";
-import { Landmark, Wallet as WalletIcon, ChevronRight, Plus, Clock, Loader2, RefreshCw, Check, ExternalLink, Trash2, Shield, AlertTriangle, Send } from "lucide-react";
+import { Landmark, Wallet as WalletIcon, ChevronRight, Plus, Clock, Loader2, RefreshCw, Check, ExternalLink, Trash2, Shield, AlertTriangle, Send, Zap } from "lucide-react";
 import { useAuth } from "../hooks/useAuth";
 import { useNear } from "../hooks/useNearWallet";
 import {
@@ -25,7 +25,9 @@ import {
   type Wallet, type Proposal, type Intent,
 } from "../lib/near";
 import { schnorrSign, defaultExpiryNs, buildOwnerMessage, buildApprovalEvent, extractEventFields } from "../lib/schnorr";
-import { NEAR_RPC } from "../lib/constants";
+import { NEAR_RPC, RELAYER_RELAYS } from "../lib/constants";
+import { pool } from "../lib/nostr";
+import type { Event } from "nostr-tools";
 import { LoginScreen } from "../components/LoginScreen";
 
 const STATUS_STYLES: Record<string, string> = {
@@ -80,6 +82,16 @@ async function callMethod(
     ],
   });
   return tx;
+}
+
+// ── Publish a signed event to relayer relays ──
+async function publishToRelayerRelays(event: Event): Promise<void> {
+  const results = await Promise.allSettled(
+    RELAYER_RELAYS.map((r) => pool.publish([r], event)),
+  );
+  const ok = results.filter((r) => r.status === "fulfilled").length;
+  console.log(`[relayer] published to ${ok}/${RELAYER_RELAYS.length} relays`);
+  if (ok === 0) throw new Error("Failed to publish to any relay");
 }
 
 export default function GovernancePage() {
@@ -430,7 +442,7 @@ function TreasuryCard({
                     onToggle={() => setExpandedWallet(expandedWallet === wName ? null : wName)}
                     isOwner={isOwner}
                     canSign={canSign}
-              signEventRaw={signEventRaw}
+                    signEventRaw={signEventRaw}
                     userNpub={userNpub}
                     secretKey={secretKey}
                     walletObj={walletObj}
@@ -474,6 +486,8 @@ function WalletDetail({
   const [approvingId, setApprovingId] = useState<number | null>(null);
   const [executingId, setExecutingId] = useState<number | null>(null);
   const [actionError, setActionError] = useState("");
+  const [useRelayer, setUseRelayer] = useState(false);
+  const [relayerStatus, setRelayerStatus] = useState<"idle" | "publishing" | "submitted">("idle");
 
   const { data: balance } = useQuery({
     queryKey: ["wal-bal", contractId, walletName],
@@ -514,8 +528,8 @@ function WalletDetail({
       + (p.nostr_approval_bitmap ?? 0).toString(2).split("1").length - 1;
   }
 
-  const handleApprove = async (proposal: Proposal) => {
-    if ((!secretKey && !signEventRaw) || !walletObj) return;
+  const handleApprove = async (proposal: Proposal, cancel = false) => {
+    if (!secretKey && !signEventRaw) return;
     const intent = intents.find((i) => i.index === proposal.intent_index);
     if (!intent) { setActionError("Intent not found"); return; }
 
@@ -524,45 +538,103 @@ function WalletDetail({
 
     setApprovingId(proposal.id);
     setActionError("");
+    setRelayerStatus("idle");
     try {
       const message = await getProposalMessage(contractId, walletName, proposal.id);
       if (!message) throw new Error("Could not get proposal message");
 
+      const methodName = cancel ? "cancel_vote_with_event" : "approve_with_event";
+
+      // ── nsec path ──
       if (secretKey) {
-        // nsec path: direct schnorr sign (cheaper)
-        const expiresAt = defaultExpiryNs();
-        const signature = schnorrSign(message, secretKey);
-        await callMethod(walletObj, contractId, "approve", {
-          wallet_name: walletName,
-          proposal_id: proposal.id,
-          approver_index: approverIndex,
-          pubkey_hex: userNpub,
-          signature,
-          expires_at: expiresAt,
-        });
-      } else if (signEventRaw) {
-        // NIP-46 path: sign a kind-37500 event via bunker
-        const evtTemplate = buildApprovalEvent({
-          pubkey: userNpub,
-          proposalMessage: message,
-          contractId,
-          walletName,
-          proposalId: proposal.id,
-        });
-        const signedEvent = await signEventRaw(evtTemplate);
-        const fields = extractEventFields(signedEvent);
-        await callMethod(walletObj, contractId, "approve_with_event", {
-          wallet_name: walletName,
-          proposal_id: proposal.id,
-          approver_index: approverIndex,
-          ...fields,
-        });
+        if (useRelayer) {
+          // Sign kind-37500 locally, publish to relays for watcher to pick up
+          const { finalizeEvent } = await import("nostr-tools");
+          const evtTemplate = buildApprovalEvent({
+            pubkey: userNpub,
+            proposalMessage: message,
+            contractId,
+            walletName,
+            proposalId: proposal.id,
+            approverIndex,
+            action: cancel ? "cancel" : "approve",
+          });
+          const signedEvent = finalizeEvent(
+            { kind: evtTemplate.kind, content: evtTemplate.content, tags: evtTemplate.tags, created_at: evtTemplate.created_at },
+            secretKey,
+          );
+          setRelayerStatus("publishing");
+          await publishToRelayerRelays(signedEvent);
+          setRelayerStatus("submitted");
+          // Poll for on-chain change
+          setTimeout(() => {
+            queryClient.invalidateQueries({ queryKey: ["wal-props"] });
+            queryClient.invalidateQueries({ queryKey: ["wal-state"] });
+          }, 8000);
+        } else {
+          // Direct schnorr sign (cheaper, no watcher needed)
+          const expiresAt = defaultExpiryNs();
+          const signature = schnorrSign(message, secretKey);
+          await callMethod(walletObj, contractId, "approve", {
+            wallet_name: walletName,
+            proposal_id: proposal.id,
+            approver_index: approverIndex,
+            pubkey_hex: userNpub,
+            signature,
+            expires_at: expiresAt,
+          });
+          queryClient.invalidateQueries({ queryKey: ["wal-props"] });
+          queryClient.invalidateQueries({ queryKey: ["wal-state"] });
+        }
+        return;
       }
 
-      queryClient.invalidateQueries({ queryKey: ["wal-props"] });
-      queryClient.invalidateQueries({ queryKey: ["wal-state"] });
+      // ── NIP-46 path ──
+      if (signEventRaw) {
+        if (useRelayer) {
+          // Sign kind-37500 via bunker, publish to relays
+          const evtTemplate = buildApprovalEvent({
+            pubkey: userNpub,
+            proposalMessage: message,
+            contractId,
+            walletName,
+            proposalId: proposal.id,
+            approverIndex,
+            action: cancel ? "cancel" : "approve",
+          });
+          const signedEvent = await signEventRaw(evtTemplate);
+          setRelayerStatus("publishing");
+          await publishToRelayerRelays(signedEvent);
+          setRelayerStatus("submitted");
+          setTimeout(() => {
+            queryClient.invalidateQueries({ queryKey: ["wal-props"] });
+            queryClient.invalidateQueries({ queryKey: ["wal-state"] });
+          }, 8000);
+        } else {
+          // Call contract directly via NEAR wallet
+          const evtTemplate = buildApprovalEvent({
+            pubkey: userNpub,
+            proposalMessage: message,
+            contractId,
+            walletName,
+            proposalId: proposal.id,
+            approverIndex,
+          });
+          const signedEvent = await signEventRaw(evtTemplate);
+          const fields = extractEventFields(signedEvent);
+          await callMethod(walletObj, contractId, methodName, {
+            wallet_name: walletName,
+            proposal_id: proposal.id,
+            approver_index: approverIndex,
+            ...fields,
+          });
+          queryClient.invalidateQueries({ queryKey: ["wal-props"] });
+          queryClient.invalidateQueries({ queryKey: ["wal-state"] });
+        }
+      }
     } catch (e: any) {
       setActionError(e.message || "Approval failed");
+      setRelayerStatus("idle");
     } finally {
       setApprovingId(null);
     }
@@ -640,6 +712,24 @@ function WalletDetail({
             </div>
           )}
 
+          {canSign && isOwner && (
+            <div className="flex items-center justify-between mt-3 px-2 py-1.5">
+              <button
+                onClick={() => setUseRelayer(!useRelayer)}
+                className={`flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-[6px] border cursor-pointer transition-colors ${useRelayer ? "text-neon border-neon/30 bg-neon/5" : "text-text4 border-brd hover:border-neon/20"}`}
+              >
+                <Zap size={10} />
+                Relayer
+              </button>
+              {useRelayer && relayerStatus === "submitted" && (
+                <span className="text-neon text-[10px]">Published, waiting for watcher…</span>
+              )}
+              {useRelayer && relayerStatus === "publishing" && (
+                <span className="text-yellow text-[10px] flex items-center gap-1"><Loader2 size={10} className="animate-spin" /> Publishing…</span>
+              )}
+            </div>
+          )}
+
           {actionError && (
             <div className="mt-2 px-2 py-1.5 rounded-[8px] bg-red/10 border border-red/20 text-red text-[11px]">
               {actionError.length > 120 ? actionError.slice(0, 120) + "…" : actionError}
@@ -685,13 +775,22 @@ function WalletDetail({
                         className="inline-flex items-center gap-1 px-3 py-1.5 rounded-[8px] text-[11px] font-medium bg-neon text-bg border-none cursor-pointer hover:brightness-110 disabled:opacity-50"
                       >
                         {approvingId === p.id ? <Loader2 size={11} className="animate-spin" /> : <Shield size={11} />}
-                        Approve
+                        {useRelayer ? "Approve (relay)" : "Approve"}
                       </button>
                     )}
                     {alreadyApproved && !isApproved && !isExecuted && (
                       <span className="inline-flex items-center gap-1 px-2 py-1.5 text-[10px] text-neon">
                         <Check size={10} /> You approved
                       </span>
+                    )}
+                    {alreadyApproved && !isApproved && !isExecuted && canSign && myApproverIdx !== null && useRelayer && (
+                      <button
+                        onClick={() => handleApprove(p, true)}
+                        disabled={approvingId === p.id}
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-[8px] text-[11px] font-medium bg-red/10 text-red border border-red/25 cursor-pointer hover:bg-red/20 disabled:opacity-50"
+                      >
+                        Cancel
+                      </button>
                     )}
                     {isApproved && !isExecuted && isOwner && canSign && (
                       <button
