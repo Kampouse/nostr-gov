@@ -12,7 +12,7 @@ storage = "sqlite"
 
 [vars]
 NEAR_RPC = "https://rpc.testnet.fastnear.com"
+RELAY_URLS = "wss://relay.primal.net,wss://nos.lol,wss://relay.damus.io"
 RELAY_URL = "wss://relay.primal.net"
-SUBSCRIPTION_TAG = "nostrgov-benchv5.vault.kampy.testnet"
-NEAR_ACCOUNT_ID = "nostr-watcher.kampy.testnet"
+NEAR_ACCOUNT_ID = "nw82a7e91.testnet"
 TREASURY_CONTRACT_ID = "benchv5.vault.kampy.testnet"

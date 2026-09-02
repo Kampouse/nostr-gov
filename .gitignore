@@ -3,3 +3,4 @@ node_modules/
 *.cjs
 keys.json
 .DS_Store
+watcher-key.json

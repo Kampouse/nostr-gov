@@ -2,8 +2,9 @@
  * nostr-relay-watcher
  *
  * Cloudflare Worker + Durable Object.
- * Subscribes to a Nostr relay via WebSocket, watches for approval/cancel
- * events tagged with the treasury contract ID, and submits them to NEAR.
+ * Subscribes to Nostr relay(s) via WebSocket for kind-37500 governance
+ * events, verifies they target our treasury contract, and submits them
+ * to NEAR via approve_with_event / cancel_vote_with_event.
  */
 
 // ── Types ─────────────────────────────────────────────────────────────
@@ -11,9 +12,9 @@
 interface Env {
   NEAR_RPC: string;
   NEAR_ACCOUNT_ID: string;
+  RELAY_URLS?: string;
   RELAY_URL: string;
-  SUBSCRIPTION_TAG: string;
-  NEAR_SIGNER_KEY: string; // ed25519:<base64-secretKey>
+  NEAR_SIGNER_KEY: string;
   TREASURY_CONTRACT_ID: string;
   RELAY_WATCHER: DurableObjectNamespace;
 }
@@ -28,103 +29,183 @@ interface NostrEvent {
   sig: string;
 }
 
+type EventStatus = "pending" | "submitted" | "success" | "failed";
+
+interface EventRecord {
+  eventId: string;
+  status: EventStatus;
+  method: string;
+  walletName: string;
+  proposalId: number;
+  txHash: string | null;
+  error: string | null;
+  retries: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface RelayConn {
+  ws: WebSocket;
+  url: string;
+}
+
+class TxResult {
+  ok: boolean;
+  txHash: string | null;
+  error: string | null;
+  contractSuccess: boolean | null;
+
+  get recordUpdate() {
+    return {
+      txHash: this.txHash,
+      error: this.error,
+      status: (this.ok ? "success" : "failed") as EventStatus,
+    };
+  }
+
+  constructor(ok: boolean, txHash: string | null, error: string | null, contractSuccess: boolean | null) {
+    this.ok = ok;
+    this.txHash = txHash;
+    this.error = error;
+    this.contractSuccess = contractSuccess;
+  }
+}
+
+// ── Constants ───────────────────────────────────────────────────────────
+
+const GOVERNANCE_KIND = 37500;
+const MAX_EVENTS = 500;
+const MAX_RETRIES = 3;
+const RETRY_DELAYS = [1000, 5000, 15000];
+
 // ── Durable Object ────────────────────────────────────────────────────
 
 export class RelayWatcher {
   private state: DurableObjectState;
   private env: Env;
-  private ws: WebSocket | null = null;
+  private conns: RelayConn[] = [];
   private processedEvents: Set<string> = new Set();
-  private reconnectTimer: number | null = null;
+  private reconnectTimers: Map<string, number> = new Map();
+  private lastError: string | null = null;
+  private eventLog: EventRecord[] = [];
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
   }
 
-  // HTTP fetch
+  private get relayUrls(): string[] {
+    if (this.env.RELAY_URLS) {
+      return this.env.RELAY_URLS.split(",").map((s) => s.trim()).filter(Boolean);
+    }
+    return [this.env.RELAY_URL];
+  }
+
+  // ── HTTP fetch ─────────────────────────────────────────────────────
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({
-        connected: this.ws !== null && this.ws.readyState === WebSocket.OPEN,
+        connected: this.conns.filter((c) => c.ws.readyState === WebSocket.OPEN).length,
+        relays: this.conns.map((c) => ({ url: c.url, open: c.ws.readyState === WebSocket.OPEN })),
         treasury: this.env.TREASURY_CONTRACT_ID,
-        relay: this.env.RELAY_URL,
         account: this.env.NEAR_ACCOUNT_ID,
         processed: this.processedEvents.size,
+        lastError: this.lastError,
+        recentEvents: this.eventLog.slice(-20).map((e) => ({
+          eventId: e.eventId.slice(0, 12),
+          status: e.status,
+          method: e.method,
+          walletName: e.walletName,
+          proposalId: e.proposalId,
+          txHash: e.txHash?.slice(0, 16) ?? null,
+          error: e.error,
+          retries: e.retries,
+        })),
       });
     }
 
     if (request.method === "POST" && url.pathname === "/connect") {
-      this.connect();
-      return Response.json({ ok: true });
+      this.connectAll();
+      return Response.json({ ok: true, relays: this.relayUrls });
     }
 
     if (request.method === "POST" && url.pathname === "/disconnect") {
-      this.disconnect();
+      this.disconnectAll();
       return Response.json({ ok: true });
     }
 
     return new Response("Not found", { status: 404 });
   }
 
-  // ── Relay connection ───────────────────────────────────────────────
+  // ── Relay connections ──────────────────────────────────────────────
 
-  private connect() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+  private connectAll() {
+    for (const url of this.relayUrls) this.connectRelay(url);
+  }
 
-    console.log(`[watcher] connecting to ${this.env.RELAY_URL}`);
-    this.ws = new WebSocket(this.env.RELAY_URL);
+  private disconnectAll() {
+    for (const url of this.relayUrls) this.disconnectRelay(url);
+  }
 
-    this.ws.addEventListener("open", () => {
-      console.log("[watcher] relay connected, subscribing");
-      this.ws!.send(
-        JSON.stringify([
-          "REQ",
-          "watcher-sub",
-          { kinds: [1], "#t": [this.env.SUBSCRIPTION_TAG], limit: 100 },
-        ]),
-      );
+  private connectRelay(url: string) {
+    const existing = this.conns.find((c) => c.url === url);
+    if (existing?.ws.readyState === WebSocket.OPEN) return;
+
+    console.log(`[watcher] connecting to ${url}`);
+    const ws = new WebSocket(url);
+    const conn: RelayConn = { ws, url };
+    this.conns.push(conn);
+
+    ws.addEventListener("open", () => {
+      console.log(`[watcher] connected to ${url}, subscribing`);
+      // Subscribe to kind-37500 events tagged with our contract
+      ws.send(JSON.stringify([
+        "REQ",
+        "gov-watch",
+        { kinds: [GOVERNANCE_KIND], "#contract": [this.env.TREASURY_CONTRACT_ID], limit: 100 },
+      ]));
     });
 
-    this.ws.addEventListener("message", (event: MessageEvent) => {
-      this.handleRelayMessage(event.data as string);
+    ws.addEventListener("message", (event: MessageEvent) => {
+      this.handleRelayMessage(event.data as string, url);
     });
 
-    this.ws.addEventListener("close", () => {
-      console.log("[watcher] relay disconnected");
-      this.ws = null;
-      this.scheduleReconnect();
+    ws.addEventListener("close", () => {
+      console.log(`[watcher] disconnected from ${url}`);
+      this.conns = this.conns.filter((c) => c.ws !== ws);
+      this.scheduleReconnect(url);
     });
 
-    this.ws.addEventListener("error", () => {
-      console.log("[watcher] relay error");
+    ws.addEventListener("error", () => {
+      console.log(`[watcher] relay error on ${url}`);
     });
   }
 
-  private disconnect() {
-    if (this.reconnectTimer !== null) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
-      this.ws.close(1000, "shutdown");
-      this.ws = null;
+  private disconnectRelay(url: string) {
+    const timer = this.reconnectTimers.get(url);
+    if (timer !== undefined) { clearTimeout(timer); this.reconnectTimers.delete(url); }
+    const conn = this.conns.find((c) => c.url === url);
+    if (conn) {
+      conn.ws.close(1000, "shutdown");
+      this.conns = this.conns.filter((c) => c.ws !== conn.ws);
     }
   }
 
-  private scheduleReconnect() {
-    if (this.reconnectTimer !== null) return;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
+  private scheduleReconnect(url: string) {
+    if (this.reconnectTimers.has(url)) return;
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(url);
+      this.connectRelay(url);
     }, 5000) as unknown as number;
+    this.reconnectTimers.set(url, timer);
   }
 
   // ── Relay message handling ──────────────────────────────────────────
 
-  private handleRelayMessage(raw: string) {
+  private handleRelayMessage(raw: string, relayUrl: string) {
     let msg: unknown;
     try { msg = JSON.parse(raw); } catch { return; }
     if (!Array.isArray(msg)) return;
@@ -133,13 +214,13 @@ export class RelayWatcher {
 
     if (type === "EVENT") {
       const [, , event] = msg as [string, string, NostrEvent];
-      this.handleNostrEvent(event);
+      this.handleGovernanceEvent(event, relayUrl);
     } else if (type === "EOSE") {
-      console.log("[watcher] caught up, listening for new events");
+      console.log(`[watcher] caught up on ${relayUrl}`);
     }
   }
 
-  private async handleNostrEvent(event: NostrEvent) {
+  private async handleGovernanceEvent(event: NostrEvent, relayUrl: string) {
     if (this.processedEvents.has(event.id)) return;
     this.processedEvents.add(event.id);
 
@@ -148,43 +229,117 @@ export class RelayWatcher {
       this.processedEvents = new Set(arr.slice(-5000));
     }
 
-    console.log(`[watcher] event ${event.id.slice(0, 12)} from ${event.pubkey.slice(0, 16)}`);
-    console.log(`[watcher] content: ${event.content.slice(0, 120)}`);
+    console.log(`[watcher] event ${event.id.slice(0, 12)} kind=${event.kind} from ${event.pubkey.slice(0, 16)} via ${relayUrl}`);
 
-    const action = this.parseAction(event);
-    if (!action) {
-      console.log(`[watcher] no valid action, skipping`);
+    // Parse the event to determine contract method
+    const parsed = this.parseGovernanceEvent(event);
+    if (!parsed) {
+      console.log(`[watcher] event does not target our contract or missing required tags, skipping`);
       return;
     }
 
-    const ok = await this.submitToNear(action, event);
-    console.log(`[watcher] ${ok ? "OK" : "FAILED"} ${action.method} for ${event.id.slice(0, 12)}`);
+    const record: EventRecord = {
+      eventId: event.id,
+      status: "pending",
+      method: parsed.method,
+      walletName: parsed.walletName,
+      proposalId: parsed.proposalId,
+      txHash: null,
+      error: null,
+      retries: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    this.pushEventLog(record);
+
+    const result = await this.submitWithRetry(parsed, event);
+    const idx = this.eventLog.findIndex((e) => e.eventId === event.id);
+    if (idx >= 0) {
+      this.eventLog[idx] = { ...this.eventLog[idx], ...result.recordUpdate, updatedAt: Date.now() };
+    }
+
+    console.log(`[watcher] ${result.ok ? "OK" : "FAILED"} ${parsed.method} ${parsed.walletName}#${parsed.proposalId}${result.txHash ? ` tx ${result.txHash.slice(0, 16)}` : ""}${result.error ? ` err: ${result.error}` : ""}`);
+    this.lastError = result.error;
+
+    // Publish result back to all connected relays
+    this.publishResult(event, result, relayUrl);
   }
 
-  // ── Parse action ──────────────────────────────────────────────────
+  // ── Parse governance event ────────────────────────────────────────
 
-  private parseAction(event: NostrEvent): { method: string; proposalId: number } | null {
-    const content = event.content.toLowerCase();
+  private parseGovernanceEvent(event: NostrEvent): {
+    method: string;
+    walletName: string;
+    proposalId: number;
+    approverIndex: number;
+  } | null {
+    // Must be kind 37500
+    if (event.kind !== GOVERNANCE_KIND) return null;
 
-    const hasTag = event.tags.some(
-      (t) => t[0] === "t" && t[1]?.toLowerCase() === this.env.SUBSCRIPTION_TAG.toLowerCase(),
-    );
-    if (!hasTag) return null;
+    // Check #contract tag matches our treasury
+    const contractTag = event.tags.find((t) => t[0] === "contract");
+    if (!contractTag || contractTag[1] !== this.env.TREASURY_CONTRACT_ID) return null;
 
-    const approve = content.match(/approve\s+proposal\s+(\d+)/);
-    if (approve) return { method: "approve_with_event", proposalId: parseInt(approve[1]!, 10) };
+    // Extract wallet name and proposal ID from tags
+    const walletTag = event.tags.find((t) => t[0] === "wallet");
+    const proposalTag = event.tags.find((t) => t[0] === "proposal");
+    if (!walletTag?.[1] || !proposalTag?.[1]) return null;
 
-    const cancel = content.match(/cancel_vote\s+proposal\s+(\d+)/);
-    if (cancel) return { method: "cancel_vote_with_event", proposalId: parseInt(cancel[1]!, 10) };
+    const walletName = walletTag[1];
+    const proposalId = parseInt(proposalTag[1], 10);
+    if (isNaN(proposalId)) return null;
 
-    return null;
+    // Determine approver_index from #approver tag if present, else default 0
+    const approverTag = event.tags.find((t) => t[0] === "approver");
+    const approverIndex = approverTag?.[1] ? parseInt(approverTag[1], 10) : 0;
+
+    // Determine method from #action tag or content heuristic
+    const actionTag = event.tags.find((t) => t[0] === "action");
+    const method = actionTag?.[1] === "cancel"
+      ? "cancel_vote_with_event"
+      : "approve_with_event";
+
+    return { method, walletName, proposalId, approverIndex };
+  }
+
+  // ── Retry logic ────────────────────────────────────────────────────
+
+  private async submitWithRetry(
+    parsed: { method: string; walletName: string; proposalId: number; approverIndex: number },
+    event: NostrEvent,
+  ): Promise<TxResult> {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const result = await this.submitToNear(parsed, event);
+      if (result.ok) return result;
+
+      const isRetryable = result.error && (
+        result.error.includes("timeout") ||
+        result.error.includes("Timeout") ||
+        result.error.includes("500") ||
+        result.error.includes("502") ||
+        result.error.includes("503") ||
+        result.error.includes("Expired") ||
+        result.error.includes("nonce") ||
+        result.error.includes("send_tx")
+      );
+
+      if (!isRetryable || attempt >= MAX_RETRIES) return result;
+
+      const delay = RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)];
+      console.log(`[watcher] retryable, attempt ${attempt + 1}/${MAX_RETRIES}, ${delay}ms: ${result.error}`);
+      await sleep(delay);
+    }
+    return new TxResult(false, null, "max retries exceeded", null);
   }
 
   // ── Submit to NEAR ──────────────────────────────────────────────────
 
-  private async submitToNear(action: { method: string; proposalId: number }, event: NostrEvent): Promise<boolean> {
+  private async submitToNear(
+    parsed: { method: string; walletName: string; proposalId: number; approverIndex: number },
+    event: NostrEvent,
+  ): Promise<TxResult> {
     try {
-      const txBody = await this.buildSignedTransaction(action.method, event);
+      const txBody = await this.buildSignedTransaction(parsed, event);
 
       const res = await fetch(this.env.NEAR_RPC, {
         method: "POST",
@@ -192,51 +347,137 @@ export class RelayWatcher {
         body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method: "broadcast_tx_commit", params: [txBody] }),
       });
 
-      const data = (await res.json()) as { error?: { message: string }; result?: { transaction_hash?: string; status?: { FinalExecutionStatus?: string } } };
+      const data = await res.json() as any;
 
       if (data.error) {
-        console.log(`[watcher] NEAR error: ${data.error.message}`);
-        return false;
+        const cause = data.error.cause?.name || "";
+        const txErr = data.error.data?.TxExecutionError?.InvalidTxError || "";
+        const detail = txErr || cause || JSON.stringify(data.error.data || "");
+        const msg = data.error.message || "Unknown RPC error";
+        return new TxResult(false, null, detail ? `${msg}: ${detail}` : msg, null);
       }
 
-      console.log(`[watcher] tx ${data.result?.transaction_hash?.slice(0, 16)} = ${data.result?.status?.FinalExecutionStatus}`);
-      return true;
+      const txHash: string = data.result?.transaction_hash ?? null;
+      const execStatus = data.result?.status?.FinalExecutionStatus;
+      const receipts = data.result?.receipts_outcome ?? [];
+
+      let contractSuccess: boolean | null = null;
+      let contractError: string | null = null;
+
+      for (const receipt of receipts) {
+        const outcome = receipt.outcome;
+        if (!outcome) continue;
+        if (outcome.status?.Failure) {
+          contractSuccess = false;
+          contractError = outcome.status.Failure?.ActionError?.kind?.FunctionCallError?.ExecutionError
+            || outcome.status.Failure?.ActionError?.kind?.FunctionCallError?.WasmTrap
+            || JSON.stringify(outcome.status.Failure);
+          break;
+        }
+        if (outcome.status?.SuccessValue !== undefined) {
+          if (receipt.executor_id === this.env.TREASURY_CONTRACT_ID) {
+            contractSuccess = true;
+          }
+        }
+      }
+
+      const ok = execStatus === "FINAL" || execStatus === "EXECUTED_OPTIMISTIC";
+      const error = contractSuccess === false ? contractError : (!ok ? `status: ${execStatus}` : null);
+
+      return new TxResult(ok, txHash, error, contractSuccess);
     } catch (e: unknown) {
-      console.log(`[watcher] submit error: ${e instanceof Error ? e.message : String(e)}`);
-      return false;
+      const msg = e instanceof Error ? e.message : String(e);
+      return new TxResult(false, null, msg, null);
     }
   }
 
-  // ── Build signed NEAR transaction using Web Crypto ──────────────────
+  // ── Publish result back to relay ─────────────────────────────────────
 
-  private async buildSignedTransaction(methodName: string, event: NostrEvent): Promise<string> {
-    const secretKeyB64 = this.env.NEAR_SIGNER_KEY.replace(/^ed25519:/, "");
-    const secretKeyRaw = base64ToBytes(secretKeyB64);
-    // near-api-js KeyPair.secretKey = base64(32-byte seed + 32-byte public)
-    const seed = secretKeyRaw.slice(0, 32);
-    const pubRaw = secretKeyRaw.slice(32, 64);
+  private publishResult(event: NostrEvent, result: TxResult, _sourceRelay: string) {
+    const status = result.ok ? "success" : "failed";
+    const content = JSON.stringify({
+      type: "watcher-result",
+      sourceEvent: event.id,
+      status,
+      txHash: result.txHash,
+      error: result.error,
+      contractSuccess: result.contractSuccess,
+    });
+
+    const statusEvent = {
+      kind: 1,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["e", event.id],
+        ["contract", this.env.TREASURY_CONTRACT_ID],
+        ["p", result.ok ? "success" : "error"],
+      ],
+      content,
+      pubkey: "watcher",
+    };
+
+    const payload = JSON.stringify(["EVENT", statusEvent]);
+    for (const conn of this.conns) {
+      if (conn.ws.readyState === WebSocket.OPEN) {
+        try {
+          conn.ws.send(payload);
+        } catch { /* ignore */ }
+      }
+    }
+  }
+
+  // ── Event log management ────────────────────────────────────────────
+
+  private pushEventLog(record: EventRecord) {
+    this.eventLog.push(record);
+    if (this.eventLog.length > MAX_EVENTS) {
+      this.eventLog = this.eventLog.slice(-Math.floor(MAX_EVENTS / 2));
+    }
+  }
+
+  // ── Build signed NEAR transaction ───────────────────────────────────
+
+  private async buildSignedTransaction(
+    parsed: { method: string; walletName: string; proposalId: number; approverIndex: number },
+    event: NostrEvent,
+  ): Promise<string> {
+    const seed = hexToBytes(this.env.NEAR_SIGNER_KEY);
+    if (seed.length !== 32) throw new Error(`Expected 32-byte hex seed, got ${seed.length}`);
+
+    // Derive public key via JWK
+    const jwkKey = await crypto.subtle.importKey(
+      "pkcs8", buildPkcs8Ed25519(seed),
+      { name: "Ed25519", namedCurve: "Ed25519" },
+      true, ["sign"],
+    );
+    const jwk = await crypto.subtle.exportKey("jwk", jwkKey) as JsonWebKey;
+    const pubRaw = base64UrlToBytes(jwk.x!);
     const pubKeyStr = "ed25519:" + bytesToBase58(pubRaw);
 
     const cryptoKey = await crypto.subtle.importKey(
-      "pkcs8",
-      buildPkcs8Ed25519(seed),
+      "pkcs8", buildPkcs8Ed25519(seed),
       { name: "Ed25519", namedCurve: "Ed25519" },
-      false,
-      ["sign"],
+      false, ["sign"],
     );
 
-    const accountId = this.env.NEAR_ACCOUNT_ID;
-    const contractId = this.env.TREASURY_CONTRACT_ID;
-
-    // Build function call args
+    // Build contract args — match approve_with_event / cancel_vote_with_event signature
     const args = JSON.stringify({
-      event: { id: event.id, pubkey: event.pubkey, created_at: event.created_at, kind: event.kind, tags: event.tags, content: event.content, sig: event.sig },
+      wallet_name: parsed.walletName,
+      proposal_id: parsed.proposalId,
+      approver_index: parsed.approverIndex,
+      pubkey_hex: event.pubkey,
+      event_id_hex: event.id,
+      created_at: event.created_at,
+      kind: event.kind,
+      tags_json: JSON.stringify(event.tags),
+      content: event.content,
+      sig_hex: event.sig,
     });
     const argsB64 = btoa(args);
 
     // Fetch nonce and block hash
     const [nonceRes, blockRes] = await Promise.all([
-      this.rpc("query", { request_type: "view_access_key", finality: "final", account_id: accountId, public_key: pubKeyStr }),
+      this.rpc("query", { request_type: "view_access_key", finality: "final", account_id: this.env.NEAR_ACCOUNT_ID, public_key: pubKeyStr }),
       this.rpc("block", { finality: "final" }),
     ]);
 
@@ -244,22 +485,20 @@ export class RelayWatcher {
     const blockHash = ((blockRes as any)?.result?.header?.hash) as string;
     if (!blockHash) throw new Error("No block hash");
 
-    // Serialize Transaction (borsh)
     const tx = serializeTransaction({
-      signerId: accountId,
+      signerId: this.env.NEAR_ACCOUNT_ID,
       publicKey: pubRaw,
       nonce: BigInt(nonce) + 1n,
-      receiverId: contractId,
-      actions: [{ type: "FunctionCall" as const, methodName, args: argsB64, gas: 30000000000000n, deposit: 0n }],
+      receiverId: this.env.TREASURY_CONTRACT_ID,
+      actions: [{ type: "FunctionCall" as const, methodName: parsed.method, args: argsB64, gas: 30000000000000n, deposit: 0n }],
       blockHash: base58ToBytes(blockHash),
     });
 
-    // Sign using Web Crypto
-    const signature = new Uint8Array(await crypto.subtle.sign("Ed25519", cryptoKey, tx));
+    // NEAR signs sha256(tx_bytes)
+    const txHash = new Uint8Array(await crypto.subtle.digest("SHA-256", tx));
+    const signature = new Uint8Array(await crypto.subtle.sign("Ed25519", cryptoKey, txHash));
 
-    // Serialize SignedTransaction
     const signed = serializeSignedTx(signature, tx);
-
     return bytesToBase64(signed);
   }
 
@@ -275,7 +514,10 @@ export class RelayWatcher {
   // ── Lifecycle ────────────────────────────────────────────────────────
 
   async alarm() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) this.connect();
+    for (const url of this.relayUrls) {
+      const conn = this.conns.find((c) => c.url === url);
+      if (!conn || conn.ws.readyState !== WebSocket.OPEN) this.connectRelay(url);
+    }
   }
 }
 
@@ -287,6 +529,12 @@ export default {
     return env.RELAY_WATCHER.get(id).fetch(request);
   },
 };
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 // ── Borsh serialization ────────────────────────────────────────────────
 
@@ -310,7 +558,7 @@ function serializeAction(action: { type: string; methodName: string; args: strin
     case "FunctionCall": {
       const argsBytes = base64ToBytes(action.args);
       return concat([
-        u32(2), // FunctionCall variant
+        u8(2),
         borshStr(action.methodName),
         borshBytes(argsBytes),
         u64(action.gas),
@@ -333,22 +581,18 @@ function serializeTransaction(tx: {
   const actionBytes = tx.actions.map(serializeAction);
   return concat([
     borshStr(tx.signerId),
-    u8(0), // PublicKey enum: ED25519
+    u8(0),
     tx.publicKey,
     u64(tx.nonce),
     borshStr(tx.receiverId),
+    tx.blockHash,
     u32(actionBytes.length),
     ...actionBytes,
-    tx.blockHash,
   ]);
 }
 
 function serializeSignedTx(signature: Uint8Array, tx: Uint8Array): Uint8Array {
-  return concat([
-    u8(0), // Signature keyType: ED25519
-    signature,
-    tx,
-  ]);
+  return concat([tx, u8(0), signature]);
 }
 
 // ── Encoding helpers ──────────────────────────────────────────────────
@@ -371,9 +615,15 @@ function base58ToBytes(s: string): Uint8Array {
   for (const c of s) { if (c === "1") pad++; else break; }
   const hex = n.toString(16).padStart(2, "0");
   const bytes = new Uint8Array(pad + Math.ceil(hex.length / 2));
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[pad + i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
+  for (let i = 0; i < hex.length; i += 2) bytes[pad + i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  return bytes;
+}
+
+function base64UrlToBytes(s: string): Uint8Array { const raw = atob(s.replace(/-/g,'+').replace(/_/g,'/')); const bytes = new Uint8Array(raw.length); for(let i=0;i<raw.length;i++) bytes[i]=raw.charCodeAt(i); return bytes; }
+
+function hexToBytes(s: string): Uint8Array {
+  const bytes = new Uint8Array(s.length / 2);
+  for (let i = 0; i < s.length; i += 2) bytes[i / 2] = parseInt(s.slice(i, i + 2), 16);
   return bytes;
 }
 
@@ -391,19 +641,17 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 function buildPkcs8Ed25519(seed: Uint8Array): Uint8Array {
-  // RFC 8410: Ed25519 private key in PKCS#8
-  // AlgorithmIdentifier: id-Ed25519 (1.3.101.112)
-  // PrivateKey: OCTET STRING wrapping the 32-byte seed
   const algoId = new Uint8Array([0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]);
-  const version = new Uint8Array([0x02, 0x01, 0x00]); // INTEGER 0 (version)
-  const privKeyWrap = new Uint8Array(4 + 32);
-  privKeyWrap[0] = 0x04; // OCTET STRING tag
-  privKeyWrap[1] = 32; // length
-  privKeyWrap.set(seed, 2);
-  const inner = concat([version, algoId, privKeyWrap]);
-  const outer = new Uint8Array(2 + inner.length);
-  outer[0] = 0x30; // SEQUENCE tag
-  outer[1] = inner.length;
-  outer.set(inner, 2);
-  return outer;
+  const version = new Uint8Array([0x02, 0x01, 0x00]);
+  const innerOctet = new Uint8Array(2 + 32);
+  innerOctet[0] = 0x04; innerOctet[1] = 32;
+  innerOctet.set(seed, 2);
+  const outerOctet = new Uint8Array(2 + innerOctet.length);
+  outerOctet[0] = 0x04; outerOctet[1] = innerOctet.length;
+  outerOctet.set(innerOctet, 2);
+  const inner = concat([version, algoId, outerOctet]);
+  const der = new Uint8Array(2 + inner.length);
+  der[0] = 0x30; der[1] = inner.length;
+  der.set(inner, 2);
+  return der;
 }
