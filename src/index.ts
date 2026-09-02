@@ -92,6 +92,8 @@ export class RelayWatcher {
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    // Re-arm the keepalive alarm on every wake (hibernation-safe).
+    void this.state.storage.setAlarm(Date.now() + 10_000).catch(() => {});
   }
 
   private get relayUrls(): string[] {
@@ -514,10 +516,12 @@ export class RelayWatcher {
   // ── Lifecycle ────────────────────────────────────────────────────────
 
   async alarm() {
+    // Reconnect any relay that isn't open, then re-arm to keep the loop alive.
     for (const url of this.relayUrls) {
       const conn = this.conns.find((c) => c.url === url);
       if (!conn || conn.ws.readyState !== WebSocket.OPEN) this.connectRelay(url);
     }
+    await this.state.storage.setAlarm(Date.now() + 30_000).catch(() => {});
   }
 }
 
