@@ -166,6 +166,34 @@ export class RelayWatcher {
       return Response.json({ ok: true });
     }
 
+    // Direct ingest fallback: the FE POSTs a signed kind-37500 event here
+    // when relay publish fails (blocked/flaky relays). Same pipeline as the
+    // relay path — parseGovernanceEvent gates contract + method whitelist,
+    // the contract verifies the schnorr sig on-chain. The event id is
+    // recomputed to reject garbage before any gas is spent.
+    if (request.method === "POST" && url.pathname === "/ingest") {
+      try {
+        const body = await request.json() as { event?: NostrEvent };
+        const event = body?.event;
+        if (!event || typeof event.id !== "string" || event.kind !== GOVERNANCE_KIND) {
+          return Response.json({ ok: false, error: "not a kind-37500 event" }, { status: 400 });
+        }
+        const recomputed = await sha256Hex(nip01Serialize(event));
+        if (recomputed !== event.id) {
+          return Response.json({ ok: false, error: "event id mismatch" }, { status: 400 });
+        }
+        if (!/^[0-9a-f]{128}$/.test(event.sig ?? "")) {
+          return Response.json({ ok: false, error: "bad sig field" }, { status: 400 });
+        }
+        this.handleGovernanceEvent(event, "ingest").catch((e) => {
+          this.lastError = String(e);
+        });
+        return Response.json({ ok: true, queued: true });
+      } catch (e) {
+        return Response.json({ ok: false, error: String(e) }, { status: 400 });
+      }
+    }
+
     return new Response("Not found", { status: 404 });
   }
 
@@ -619,6 +647,23 @@ function eventAuthFields(event: NostrEvent): Record<string, string> {
     ct: event.content,
     cat: String(event.created_at),
   };
+}
+
+// NIP-01 id serialization: [0,pubkey,created_at,kind,tags,content]
+function nip01Serialize(event: NostrEvent): string {
+  return JSON.stringify([
+    0,
+    event.pubkey,
+    event.created_at,
+    event.kind,
+    event.tags,
+    event.content,
+  ]);
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // ── Borsh serialization ────────────────────────────────────────────────

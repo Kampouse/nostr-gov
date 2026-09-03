@@ -32,7 +32,7 @@ import {
   schnorrSign, defaultExpiryNs, buildApprovalEvent, extractEventFields,
   buildGovEnvelope,
 } from "../lib/schnorr";
-import { DEFAULT_TREASURY, RELAYER_RELAYS } from "../lib/constants";
+import { DEFAULT_TREASURY, RELAYER_RELAYS, RELAYER_WATCHER_URL } from "../lib/constants";
 import { pool } from "../lib/nostr";
 import type { Event } from "nostr-tools";
 import { LoginScreen } from "../components/LoginScreen";
@@ -166,9 +166,23 @@ async function callMethodVerified(
   if (hash) await verifyTxSuccess(hash, accountId);
 }
 
-async function publishToRelayerRelays(event: Event): Promise<number> {
+async function publishToRelayerRelays(event: Event): Promise<{ relays: number; via: "relays" | "ingest" }> {
   const results = await Promise.allSettled(RELAYER_RELAYS.map((r) => pool.publish([r], event)));
-  return results.filter((r) => r.status === "fulfilled").length;
+  const ok = results.filter((r) => r.status === "fulfilled").length;
+  if (ok > 0) return { relays: ok, via: "relays" };
+  // Relay fallback: direct POST to the watcher's ingest endpoint. The
+  // event is already signed and NIP-01-id-stamped; the watcher re-verifies
+  // the id and runs the same whitelist + on-chain sig check. Covers
+  // networks where relays are blocked/unreachable (damus ws refused, etc).
+  const res = await fetch(RELAYER_WATCHER_URL + "/ingest", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event }),
+  });
+  if (!res.ok) throw new Error(`ingest failed: ${res.status} ${(await res.text()).slice(0, 100)}`);
+  const data = await res.json() as { ok?: boolean; error?: string };
+  if (!data.ok) throw new Error(data.error || "ingest rejected");
+  return { relays: 0, via: "ingest" };
 }
 
 // Sign a gov envelope (propose/execute) and publish it — the watcher picks
@@ -178,7 +192,7 @@ async function proposeViaRelayer(
   contractId: string, walletName: string,
   p: { method: "propose" | "execute"; proposalId?: string; args: Record<string, unknown> },
   signCtx: SignCtx,
-): Promise<number> {
+): Promise<{ relays: number; via: "relays" | "ingest" }> {
   const { buildGovEnvelope } = await import("../lib/schnorr");
   const { event } = await buildGovEnvelope({
     method: p.method,
@@ -561,9 +575,8 @@ function WalletLevel({
         amount: amt, recipient: payTo.trim(), token: payToken.trim(),
       }, signCtx);
       if (useRelayer) {
-        const ok = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
-        if (ok === 0) throw new Error("No relay accepted the event");
-        toast("ok", `Payout proposal #${proposalId} published — watcher will propose on-chain`);
+        const { relays, via } = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
+        toast("ok", `Payout proposal #${proposalId} ${via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — proposing on-chain`);
       } else {
         await callMethodVerified(wallet, accountId!, contractId, "propose", args);
         toast("ok", `Payout proposal #${proposalId} created`);
@@ -587,9 +600,8 @@ function WalletLevel({
         walletName, expiresAt, action: "appr", newApprovers: nps.join(","), newThreshold: apprThr || "1",
       }, signCtx);
       if (useRelayer) {
-        const ok = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
-        if (ok === 0) throw new Error("No relay accepted the event");
-        toast("ok", `Rotation #${proposalId} published — watcher will propose on-chain`);
+        const { relays, via } = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
+        toast("ok", `Rotation #${proposalId} ${via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — proposing on-chain`);
       } else {
         await callMethodVerified(wallet, accountId!, contractId, "propose", args);
         toast("ok", "Approver rotation proposed");
@@ -811,9 +823,10 @@ function ProposalLevel({
       const signed = signCtx.secretKey
         ? finalizeEvent({ kind: template.kind, content: template.content, tags: template.tags, created_at: template.created_at }, signCtx.secretKey)
         : await signCtx.signEventRaw!(template);
-      const ok = await publishToRelayerRelays(signed as Event);
-      if (ok === 0) throw new Error("No relay accepted the event");
-      toast("ok", `Published to ${ok}/${RELAYER_RELAYS.length} relays — watcher will approve on-chain`);
+      const pub = await publishToRelayerRelays(signed as Event);
+      toast("ok", pub.via === "ingest"
+        ? "Sent direct to watcher (relays unreachable) — approving on-chain"
+        : `Published to ${pub.relays}/${RELAYER_RELAYS.length} relays — approving on-chain`);
       setTimeout(refresh, 10_000);
     } catch (e: any) {
       toast("err", e.message?.slice(0, 180) || "relay approve failed");
@@ -883,8 +896,7 @@ function ProposalLevel({
         proposalId: p.id,
         args: { name: walletName, id: p.id },
       }, signCtx);
-      if (ok === 0) throw new Error("No relay accepted the event");
-      toast("ok", `Execute #${p.id} published — watcher will execute on-chain`);
+      toast("ok", `Execute #${p.id} ${ok.via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${ok.relays}/${RELAYER_RELAYS.length} relays`} — executing on-chain`);
       setTimeout(refresh, 10_000);
     } catch (e: any) {
       toast("err", e.message?.slice(0, 180) || "relay execute failed");
