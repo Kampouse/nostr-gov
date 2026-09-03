@@ -55,7 +55,7 @@ export const buildApprovalEvent = (params: {
   proposalMessage: string;
   contractId: string;
   walletName: string;
-  proposalId: number;
+  proposalId: string;
   approverIndex: number;
   action?: "approve" | "cancel";
 }): NostrEventTemplate => {
@@ -99,3 +99,23 @@ export interface SignedNostrEvent extends NostrEventTemplate {
   pubkey: string;
   sig: string;
 }
+/** Gov (admin) event — v2 event-auth shape the contract verifies:
+ * tags [t, action, nonce, expires, contract], kind 37500. */
+export const buildGovEvent = (params: {
+  action: string;
+  nonce: number;
+  expiresAt: string;
+  contractId: string;
+  content?: string;
+}): NostrEventTemplate => ({
+  kind: 37500,
+  content: params.content ?? "nostr-gov owner action",
+  tags: [
+    ["t", "nostr-gov"],
+    ["action", params.action],
+    ["nonce", String(params.nonce)],
+    ["expires", params.expiresAt],
+    ["contract", params.contractId],
+  ],
+  created_at: Math.floor(Date.now() / 1000),
+});
