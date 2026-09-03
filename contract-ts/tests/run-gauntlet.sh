@@ -56,7 +56,12 @@ except Exception:
   if [ "$E" = "ok" ]; then
     OK=$([ -z "$ERR" ] && echo 1 || echo 0)
   elif [ "$E" = "active" ] || [ "$E" = "approved" ] || [ "$E" = "executed" ]; then
-    OK=$(echo "$RET" | grep -q "\"st\":\"$E\"" && echo 1 || echo 0)
+    OK=$($PY -c 'import sys, json
+try:
+    inner = json.loads(json.loads(sys.argv[1])["result"])
+    print(1 if inner.get("st") == sys.argv[2] else 0)
+except Exception:
+    print(0)' "$RET" "$E")
   else
     OK=$([ "$E" = "$R" ] && echo 1 || echo 0)
   fi

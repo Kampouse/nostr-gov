@@ -685,7 +685,7 @@ export function execute() {
 }
 
 export function get_proposal() {
-  return getStr(`p:${near.jsonGetStr("name") ?? ""}:${near.jsonGetStr("id") ?? ""}`);
+  near.jsonReturnStr(getStr(`p:${near.jsonGetStr("name") ?? ""}:${near.jsonGetStr("id") ?? ""}`));
 }
 
 // canonical approve message for (name,id,ix,exp) — signers build the
@@ -720,7 +720,7 @@ export function get_proposal_ids() {
 }
 
 export function get_approvers() {
-  return getStr(`a:${near.jsonGetStr("name") ?? ""}`);
+  near.jsonReturnStr(getStr(`a:${near.jsonGetStr("name") ?? ""}`));
 }
 
 // ── public self-test (port of lisp test_verify_nostr) ───────────────────
