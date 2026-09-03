@@ -4,9 +4,9 @@
  */
 
 import { NEAR_RPC } from "./constants";
-import { buildGovEvent, extractEventFields } from "./schnorr";
+import { buildGovEvent, extractEventFields, defaultExpiryNs } from "./schnorr";
 
-async function rpcCall(method: string, params: Record<string, unknown>): Promise<any> {
+async function rpcCall(method: string, params: Record<string, unknown> | unknown[]): Promise<any> {
   const res = await fetch(NEAR_RPC, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -83,6 +83,54 @@ export interface Proposal {
 
 function num(v: unknown): number {
   return Number(v ?? 0);
+}
+
+// v2 event-auth fields — every admin method requires `ev` (verifyOwnerEvent
+// dies ERR_EV_REQUIRED when absent). `f` = extractEventFields(signed event).
+export function eventAuthArgs(f: ReturnType<typeof extractEventFields>): Record<string, string> {
+  return {
+    pk: f.pubkey_hex,
+    ev: f.event_id_hex,
+    sig: f.sig_hex,
+    kind: String(f.kind),
+    tags: f.tags_json,
+    ct: f.content,
+    cat: String(f.created_at),
+  };
+}
+
+// Sign a kind-37500 gov event (nsec locally, or via NIP-46 bunker) for an
+// admin action string like `create_wallet:prod` or `propose:gov:3`.
+export async function signGovEvent(
+  contractId: string,
+  action: string,
+  signCtx: { secretKey: Uint8Array | null; signEventRaw: ((t: any) => Promise<any>) | null },
+): Promise<Record<string, string>> {
+  const nonce = await getOwnerNonce(contractId);
+  const expiresAt = defaultExpiryNs();
+  const { finalizeEvent } = await import("nostr-tools");
+  const template = buildGovEvent({ action, nonce, expiresAt, contractId });
+  const signed = signCtx.secretKey
+    ? finalizeEvent(
+        { kind: template.kind, content: template.content, tags: template.tags, created_at: template.created_at },
+        signCtx.secretKey,
+      )
+    : await signCtx.signEventRaw!(template);
+  return eventAuthArgs(extractEventFields(signed));
+}
+
+// Don't trust the wallet bridge: re-check the receipt on-chain and throw if
+// ANY action in the tx failed (e.g. LackBalanceForState reverts silently in
+// some bridges — the "treasury created" alert lied once because of this).
+export async function verifyTxSuccess(txHash: string, signerId: string): Promise<void> {
+  const res = await rpcCall("tx", [txHash, signerId]);
+  const failures = (res?.receipts_outcome ?? [])
+    .map((ro: any) => ro.outcome?.status)
+    .filter((s: any) => s && "Failure" in s);
+  if (failures.length > 0) {
+    const kind = JSON.stringify(failures[0].Failure).slice(0, 200);
+    throw new Error(`Tx failed on-chain: ${kind}`);
+  }
 }
 
 // view raw string (jsonReturnStr results arrive JSON-encoded)
@@ -240,8 +288,10 @@ export async function getSpendStats(_contractId: string, _walletName: string): P
 export interface ProposeParams {
   walletName: string;
   expiresAt: string;      // proposal expiry (ns) — must be in the future
+  action?: "" | "appr" | "unp"; // "" payout (default) · "appr" rotation · "unp" unpause (gov wallet only)
   amount?: string;        // payout: yocto NEAR
   recipient?: string;     // payout: account id
+  token?: string;         // payout: NEP-141 contract (empty = native NEAR)
   newApprovers?: string;  // appr: comma-joined pubkeys
   newThreshold?: string;  // appr: threshold
 }
@@ -252,6 +302,7 @@ export async function proposeProposal(
   signCtx: { secretKey: Uint8Array | null; signEventRaw: ((t: any) => Promise<any>) | null },
 ): Promise<{ proposalId: string; args: Record<string, unknown> }> {
   const nonce = await getOwnerNonce(contractId);
+  const act = params.action ?? (params.newApprovers ? "appr" : "");
   const action = `propose:${params.walletName}:${nonce}`;
   const { finalizeEvent } = await import("nostr-tools");
   const template = buildGovEvent({ action, nonce, expiresAt: params.expiresAt, contractId });
@@ -268,20 +319,15 @@ export async function proposeProposal(
   const args: Record<string, unknown> = {
     name: params.walletName,
     pexp: params.expiresAt,
-    act: params.newApprovers ? "appr" : "",
-    pk: f.pubkey_hex,
-    ev: f.event_id_hex,
-    sig: f.sig_hex,
-    kind: String(f.kind),
-    tags: f.tags_json,
-    ct: f.content,
-    cat: String(f.created_at),
+    act,
+    tk: act === "" ? (params.token ?? "") : "",
+    ...eventAuthArgs(f),
   };
-  if (!params.newApprovers) {
+  if (act === "") {
     args.am = params.amount ?? "";
     args.rc = params.recipient ?? "";
-  } else {
-    args.np = params.newApprovers;
+  } else if (act === "appr") {
+    args.np = params.newApprovers ?? "";
     args.nt = params.newThreshold ?? "1";
   }
   return { proposalId: String(nonce), args };
