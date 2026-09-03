@@ -22,9 +22,9 @@ import {
   getOwnerNpubs, getGuardianNpub, getEventNonce, getContractVersion,
   getProposalsPaginated, getSpendStats,
   getProposalMessage, getOwnerNonce, listWallets,
-  type Wallet, type Proposal, type Intent,
+  type Wallet, type Proposal,
 } from "../lib/near";
-import { schnorrSign, defaultExpiryNs, buildOwnerMessage, buildApprovalEvent, extractEventFields } from "../lib/schnorr";
+import { schnorrSign, defaultExpiryNs, buildOwnerMessage, buildApprovalEvent, buildGovEvent, extractEventFields } from "../lib/schnorr";
 import { NEAR_RPC, RELAYER_RELAYS } from "../lib/constants";
 import { pool } from "../lib/nostr";
 import type { Event } from "nostr-tools";
@@ -162,14 +162,25 @@ export default function GovernancePage() {
       const expiresAt = defaultExpiryNs();
       const nonce = await getOwnerNonce(contractId);
       const action = `create_wallet:${newWalletName.trim()}`;
-      const message = buildOwnerMessage(action, nonce, expiresAt, contractId);
-      const signature = schnorrSign(message, secretKey);
+      const { finalizeEvent } = await import("nostr-tools");
+      const signed = finalizeEvent(
+        buildGovEvent({ action, nonce, expiresAt, contractId }),
+        secretKey,
+      );
+      const f = extractEventFields(signed);
 
       await callMethod(wallet, contractId, "create_wallet", {
         name: newWalletName.trim(),
-        signature,
-        expires_at: expiresAt,
-        nonce,
+        // born self-custody: the signer is sole approver (rotate later
+        // via an "appr" proposal)
+        pks: pubkey,
+        thr: "1",
+        pk: f.pubkey_hex,
+        sig: f.sig_hex,
+        kind: String(f.kind),
+        tags: f.tags_json,
+        ct: f.content,
+        cat: String(f.created_at),
       }, { deposit: BigInt(STORAGE_DEPOSIT) });
 
       setNewWalletName("");
@@ -287,10 +298,16 @@ export default function GovernancePage() {
                 const expiresAt = defaultExpiryNs();
                 const nonce = await getOwnerNonce(contractId);
                 const action = `create_wallet:${name}`;
-                const message = buildOwnerMessage(action, nonce, expiresAt, contractId);
-                const signature = schnorrSign(message, secretKey!);
+                const { finalizeEvent } = await import("nostr-tools");
+                const signed = finalizeEvent(
+                  buildGovEvent({ action, nonce, expiresAt, contractId }),
+                  secretKey!,
+                );
+                const f = extractEventFields(signed);
                 return callMethod(wallet, contractId, "create_wallet", {
-                  name, signature, expires_at: expiresAt, nonce,
+                  name, pks: pubkey!, thr: "1",
+                  pk: f.pubkey_hex, sig: f.sig_hex, kind: String(f.kind),
+                  tags: f.tags_json, ct: f.content, cat: String(f.created_at),
                 }, { deposit: BigInt(STORAGE_DEPOSIT) });
               }}
             />
@@ -483,15 +500,15 @@ function WalletDetail({
   signEventRaw: ((t: { kind: number; content: string; tags: string[][] }) => Promise<any>) | null;
 }) {
   const queryClient = useQueryClient();
-  const [approvingId, setApprovingId] = useState<number | null>(null);
-  const [executingId, setExecutingId] = useState<number | null>(null);
+  const [approvingId, setApprovingId] = useState<string | null>(null);
+  const [executingId, setExecutingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState("");
   const [useRelayer, setUseRelayer] = useState(false);
   const [relayerStatus, setRelayerStatus] = useState<"idle" | "publishing" | "submitted">("idle");
 
   const { data: balance } = useQuery({
     queryKey: ["wal-bal", contractId, walletName],
-    queryFn: () => getWalletNearBalance(contractId, walletName),
+    queryFn: () => getWalletNearBalance(contractId),
     enabled: isExpanded,
   });
 
@@ -514,36 +531,43 @@ function WalletDetail({
   });
 
   const bal = balance ? (Number(balance) / 1e24).toFixed(3) : "—";
-  const intents: Intent[] = state?.intents ?? [];
+  const approvers = state?.approvers ?? null;
+  const approverPks: string[] = approvers?.pks ? approvers.pks.split(",") : [];
+  const threshold = Number(approvers?.thr ?? 1);
 
-  // Find the user's approver_index in each intent's nostr_approvers
-  function findApproverIndex(intent: Intent): number | null {
-    const idx = intent.nostr_approvers.indexOf(userNpub);
+  // the user's index in the wallet's approver set
+  function findApproverIndex(): number | null {
+    const idx = approverPks.indexOf(userNpub);
     return idx >= 0 ? idx : null;
   }
 
-  // Count total approvals (NEAR bitmap + nostr bitmap)
   function approvalCount(p: Proposal): number {
-    return (p.approval_bitmap ?? 0).toString(2).split("1").length - 1
-      + (p.nostr_approval_bitmap ?? 0).toString(2).split("1").length - 1;
+    return Number(p.ac ?? 0);
+  }
+
+  function actLabel(act: string): string {
+    if (act === "appr") return "Rotate approvers";
+    if (act === "unp") return "Unpause";
+    return "Payout";
   }
 
   const handleApprove = async (proposal: Proposal, cancel = false) => {
     if (!secretKey && !signEventRaw) return;
-    const intent = intents.find((i) => i.index === proposal.intent_index);
-    if (!intent) { setActionError("Intent not found"); return; }
 
-    const approverIndex = findApproverIndex(intent);
+    const approverIndex = findApproverIndex();
     if (approverIndex === null) { setActionError("Your npub is not in the approver list"); return; }
 
     setApprovingId(proposal.id);
     setActionError("");
     setRelayerStatus("idle");
     try {
-      const message = await getProposalMessage(contractId, walletName, proposal.id);
+      const expiresAt = defaultExpiryNs();
+      const message = await getProposalMessage(contractId, walletName, proposal.id, approverIndex, expiresAt);
       if (!message) throw new Error("Could not get proposal message");
 
-      const methodName = cancel ? "cancel_vote_with_event" : "approve_with_event";
+      // v2 contract: relay path target (watcher submits approve_with_event);
+      // direct path signs the message itself
+      const methodName = "approve";
 
       // ── nsec path ──
       if (secretKey) {
@@ -576,9 +600,9 @@ function WalletDetail({
           const expiresAt = defaultExpiryNs();
           const signature = schnorrSign(message, secretKey);
           await callMethod(walletObj, contractId, "approve", {
-            wallet_name: walletName,
-            proposal_id: proposal.id,
-            approver_index: approverIndex,
+            name: walletName,
+            id: proposal.id,
+            ix: String(approverIndex),
             pubkey_hex: userNpub,
             signature,
             expires_at: expiresAt,
@@ -619,14 +643,17 @@ function WalletDetail({
             walletName,
             proposalId: proposal.id,
             approverIndex,
+            action: "approve",
           });
           const signedEvent = await signEventRaw(evtTemplate);
           const fields = extractEventFields(signedEvent);
-          await callMethod(walletObj, contractId, methodName, {
-            wallet_name: walletName,
-            proposal_id: proposal.id,
-            approver_index: approverIndex,
-            ...fields,
+          await callMethod(walletObj, contractId, "approve_with_event", {
+            pk: fields.pubkey_hex,
+            sig: fields.sig_hex,
+            kind: String(fields.kind),
+            tags: fields.tags_json,
+            ct: fields.content,
+            cat: String(fields.created_at),
           });
           queryClient.invalidateQueries({ queryKey: ["wal-props"] });
           queryClient.invalidateQueries({ queryKey: ["wal-state"] });
@@ -649,15 +676,28 @@ function WalletDetail({
       const expiresAt = defaultExpiryNs();
       const nonce = await getOwnerNonce(contractId);
       const action = `execute:${walletName}:${proposal.id}`;
-      const message = buildOwnerMessage(action, nonce, expiresAt, contractId);
-      const signature = schnorrSign(message, secretKey);
-
-      await callMethod(walletObj, contractId, "execute", {
-        wallet_name: walletName,
-        proposal_id: proposal.id,
-        signature,
-        expires_at: expiresAt,
+      const { finalizeEvent } = await import("nostr-tools");
+      const template = buildGovEvent({
+        action,
         nonce,
+        expiresAt,
+        contractId,
+        content: "nostr-gov owner action",
+      });
+      const signed = finalizeEvent(
+        { kind: template.kind, content: template.content, tags: template.tags, created_at: template.created_at },
+        secretKey!,
+      );
+      const f = extractEventFields(signed);
+      await callMethod(walletObj, contractId, "execute", {
+        name: walletName,
+        id: proposal.id,
+        pk: f.pubkey_hex,
+        sig: f.sig_hex,
+        kind: String(f.kind),
+        tags: f.tags_json,
+        ct: f.content,
+        cat: String(f.created_at),
       });
 
       queryClient.invalidateQueries({ queryKey: ["wal-props"] });
@@ -686,24 +726,20 @@ function WalletDetail({
 
       {isExpanded && (
         <div className="px-3 pb-3 border-t border-brd" style={{ animation: "fade-up 0.15s ease-out" }}>
-          {stats && (
-            <div className="flex gap-2 mt-3">
-              <div className="flex-1 p-2 rounded-[8px] bg-surface2 text-center">
-                <div className="text-text4 text-[10px]">Spent</div>
-                <div className="text-text text-[12px] font-semibold mt-0.5">
-                  {stats.total_spent ? `${(Number(stats.total_spent) / 1e24).toFixed(3)}` : "0"} Ⓝ
-                </div>
-              </div>
-              <div className="flex-1 p-2 rounded-[8px] bg-surface2 text-center">
-                <div className="text-text4 text-[10px]">Txns</div>
-                <div className="text-text text-[12px] font-semibold mt-0.5">{stats.tx_count ?? 0}</div>
-              </div>
-              <div className="flex-1 p-2 rounded-[8px] bg-surface2 text-center">
-                <div className="text-text4 text-[10px]">Intents</div>
-                <div className="text-text text-[12px] font-semibold mt-0.5">{intents.length}</div>
-              </div>
+          <div className="flex gap-2 mt-3">
+            <div className="flex-1 p-2 rounded-[8px] bg-surface2 text-center">
+              <div className="text-text4 text-[10px]">Proposals</div>
+              <div className="text-text text-[12px] font-semibold mt-0.5">{proposals.length}</div>
             </div>
-          )}
+            <div className="flex-1 p-2 rounded-[8px] bg-surface2 text-center">
+              <div className="text-text4 text-[10px]">Threshold</div>
+              <div className="text-text text-[12px] font-semibold mt-0.5">{threshold} of {approverPks.length}</div>
+            </div>
+            <div className="flex-1 p-2 rounded-[8px] bg-surface2 text-center">
+              <div className="text-text4 text-[10px]">Paused</div>
+              <div className="text-text text-[12px] font-semibold mt-0.5">{state?.paused ? "yes" : "no"}</div>
+            </div>
+          </div>
 
           {!canSign && isOwner && (
             <div className="flex items-center gap-1.5 mt-3 px-2 py-2 rounded-[8px] bg-yellow/5 border border-yellow/20 text-yellow text-[11px]">
@@ -740,35 +776,34 @@ function WalletDetail({
             <p className="text-text4 text-[12px] text-center py-4">No proposals yet.</p>
           ) : (
             proposals.map((p: Proposal) => {
-              const intent = intents.find((i) => i.index === p.intent_index);
-              const threshold = intent?.approval_threshold ?? 1;
+              const threshold = Number(state?.approvers?.thr ?? 1);
               const approvals = approvalCount(p);
-              const myApproverIdx = intent ? findApproverIndex(intent) : null;
-              const alreadyApproved = myApproverIdx !== null && ((p.nostr_approval_bitmap ?? 0) & (1 << myApproverIdx)) !== 0;
-              const isApproved = p.status === "Approved";
-              const isExecuted = p.status === "Executed";
+              const myApproverIdx = findApproverIndex();
+              const alreadyApproved = myApproverIdx !== null && ((Number(p.bl ?? 0)) & (1 << myApproverIdx)) !== 0;
+              const isApproved = p.st === "approved";
+              const isExecuted = p.st === "executed";
 
               return (
                 <div key={p.id} className="p-3 border border-brd rounded-[10px] bg-bg mt-2">
                   <div className="flex items-center justify-between">
-                    <span className="text-text text-[12px] font-semibold">#{p.id} · {intent?.name || `Intent #${p.intent_index}`}</span>
-                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${STATUS_STYLES[p.status] || STATUS_STYLES.Active || "text-text3 bg-surface2 border-brd"}`}>
-                      {p.status}
+                    <span className="text-text text-[12px] font-semibold">#{p.id} · {actLabel(p.act)}</span>
+                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${STATUS_STYLES[p.st] || "text-text3 bg-surface2 border-brd"}`}>
+                      {p.st}
                     </span>
                   </div>
                   <div className="flex justify-between mt-1.5 text-text4 text-[10px]">
-                    <span className="truncate max-w-[60%] font-mono">{p.proposer}</span>
+                    <span className="truncate max-w-[60%] font-mono">{p.to || "—"}</span>
                     <span className="flex items-center gap-1">
                       <Check size={10} /> {approvals}/{threshold}
                     </span>
                   </div>
                   <div className="flex justify-between mt-0.5 text-text4 text-[10px]">
-                    <span className="flex items-center gap-1"><Clock size={10} /> {timeAgo(p.proposed_at / 1_000_000_000)}</span>
-                    <span>expires {timeAgo(p.expires_at / 1_000_000_000)}</span>
+                    <span className="flex items-center gap-1"><Clock size={10} /> {p.amt ? `${(Number(p.amt) / 1e24).toFixed(2)} Ⓝ` : ""}</span>
+                    <span>expires {timeAgo(Number(p.exp) / 1_000_000_000)}</span>
                   </div>
                   {/* Action buttons */}
                   <div className="flex gap-1.5 mt-2">
-                    {p.status === "Active" && canSign && myApproverIdx !== null && !alreadyApproved && (
+                    {p.st === "active" && canSign && myApproverIdx !== null && !alreadyApproved && (
                       <button
                         onClick={() => handleApprove(p)}
                         disabled={approvingId === p.id}
@@ -792,7 +827,7 @@ function WalletDetail({
                         Cancel
                       </button>
                     )}
-                    {isApproved && !isExecuted && isOwner && canSign && (
+                    {isApproved && !isExecuted && canSign && (
                       <button
                         onClick={() => handleExecute(p)}
                         disabled={executingId === p.id}
