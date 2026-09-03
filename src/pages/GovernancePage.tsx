@@ -109,6 +109,17 @@ function removeTreasury(id: string) {
   localStorage.setItem("nostrgov-treasuries", JSON.stringify(getTreasuries().filter(t => t !== id)));
 }
 
+// The contract has no owner view (bootstrap admin = owner_npub0, readable
+// by no view method). Remember who we deployed a treasury for, so the
+// creator keeps admin rights in the UI until a gov wallet exists on-chain.
+function getTreasuryOwner(id: string): string {
+  try { return localStorage.getItem(`nostrgov-owner:${id}`) || ""; }
+  catch { return ""; }
+}
+function saveTreasuryOwner(id: string, npub: string) {
+  try { localStorage.setItem(`nostrgov-owner:${id}`, npub); } catch { /* private mode */ }
+}
+
 /** NEAR → yocto (integer math only, up to 24 decimals) */
 function nearToYocto(v: string): string {
   const m = v.trim().match(/^(\d+)(?:\.(\d{1,24}))?$/);
@@ -247,6 +258,7 @@ function CreateTreasuryModal({
       if (!hash) throw new Error("No tx hash returned by wallet");
       await verifyTxSuccess(hash, accountId);
       saveTreasury(treasuryId);
+      saveTreasuryOwner(treasuryId, ownerNpub);
       toast("ok", `Treasury ${treasuryId} created — ${hash.slice(0, 8)}…`);
       onCreated(treasuryId);
       onClose();
@@ -343,7 +355,11 @@ function TreasuryLevel({
 }) {
   const { accountId, wallet } = useNear();
   const { data: t, isLoading, isError, error, refetch, isFetching } = useTreasury(contractId, true);
-  const isAdmin = Boolean(t?.adminPks?.includes(userNpub));
+  // on-chain admin set (gov approvers) — empty until a gov wallet exists;
+  // fall back to the locally remembered creator (fresh treasuries)
+  const onChainAdmin = Boolean(t?.adminPks?.includes(userNpub));
+  const localOwner = getTreasuryOwner(contractId) === userNpub;
+  const isAdmin = onChainAdmin || (localOwner && (t?.adminPks.length ?? 0) === 0);
   const [newWallet, setNewWallet] = useState("");
   const [creatingWallet, setCreatingWallet] = useState(false);
 
@@ -743,7 +759,9 @@ function ProposalLevel({
   const { data: treasury } = useTreasury(contractId, true);
 
   const approverPks: string[] = state?.approvers?.pks ? state.approvers.pks.split(",")
-    : (walletName === "gov" && (state?.approvers == null)) ? (treasury?.adminPks ?? []) : [];
+    : (walletName === "gov" && state?.approvers == null && getTreasuryOwner(contractId) === userNpub)
+      ? [userNpub] /* bootstrap: creator is the pre-rotation admin set */
+      : (treasury?.adminPks ?? []);
   const threshold = Number(state?.approvers?.thr ?? 1);
   const myIdx = approverPks.indexOf(userNpub) >= 0 ? approverPks.indexOf(userNpub) : null;
   const alreadyApproved = myIdx !== null && p ? (Number(p.bl ?? 0) & (1 << myIdx)) !== 0 : false;
