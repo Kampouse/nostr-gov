@@ -7,12 +7,6 @@
 
 import { useState, useCallback } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  CreateAccount,
-  DeployContract,
-  Transfer,
-  FunctionCall,
-} from "@near-js/transactions";
 import { Landmark, Wallet as WalletIcon, ChevronRight, Plus, Clock, Loader2, RefreshCw, Check, ExternalLink, Trash2, Shield, AlertTriangle, Send, Zap } from "lucide-react";
 import { useAuth } from "../hooks/useAuth";
 import { useNear } from "../hooks/useNearWallet";
@@ -85,13 +79,19 @@ async function callMethod(
 ): Promise<any> {
   const tx = await wallet.signAndSendTransaction({
     receiverId: contractId,
+    // HOT connector format ({type, params}) — the near-connect bridge
+    // passes typed actions straight through; near-api-js class instances
+    // hit its "Unsupported action type" parser throw.
     actions: [
-      new FunctionCall({
-        methodName,
-        args: new TextEncoder().encode(JSON.stringify(args)),
-        gas: opts?.gas ?? 30_000_000_000_000n,
-        deposit: opts?.deposit ?? 0n,
-      } as any),
+      {
+        type: "FunctionCall",
+        params: {
+          methodName,
+          args,
+          gas: String(opts?.gas ?? 300_000_000_000_000n),
+          deposit: String(opts?.deposit ?? 0n),
+        },
+      },
     ],
   });
   return tx;
@@ -130,17 +130,17 @@ export default function GovernancePage() {
       const wasmBytes = new Uint8Array(await wasmRes.arrayBuffer());
 
       const treasuryId = `${newName.trim()}.${accountId}`;
-      const depositYocto = BigInt(DEPOSIT_NEAR) * 10n ** 24n;
-      const initArgs = JSON.stringify({ owner_npubs: [pubkey] });
+      const depositYocto = (BigInt(DEPOSIT_NEAR) * 10n ** 24n).toString();
+      const initArgs = { owner_npubs: [pubkey] };
 
-      const args = new TextEncoder().encode(initArgs);
       const tx = await wallet.signAndSendTransaction({
         receiverId: treasuryId,
+        // HOT connector format — see callMethod comment
         actions: [
-          new CreateAccount() as any,
-          new Transfer({ deposit: depositYocto }) as any,
-          new DeployContract({ code: wasmBytes }) as any,
-          new FunctionCall({ methodName: "new", args, gas: 30_000_000_000_000n, deposit: 0n }) as any,
+          { type: "CreateAccount" },
+          { type: "Transfer", params: { deposit: depositYocto } },
+          { type: "DeployContract", params: { code: wasmBytes } },
+          { type: "FunctionCall", params: { methodName: "new", args: initArgs, gas: String(300_000_000_000_000n), deposit: "0" } },
         ],
       });
 
