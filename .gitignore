@@ -23,3 +23,10 @@ dist-ssr
 *.sln
 *.sw?
 target/
+
+# watcher (CF Worker DO)
+watcher/node_modules
+watcher/.wrangler
+watcher/*.cjs
+watcher/keys.json
+watcher/watcher-key.json
