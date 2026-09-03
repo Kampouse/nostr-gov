@@ -4,7 +4,7 @@
  * Cloudflare Worker + Durable Object.
  * Subscribes to Nostr relay(s) via WebSocket for kind-37500 governance
  * events, verifies they target our treasury contract, and submits them
- * to NEAR via approve_with_event / cancel_vote_with_event.
+ * to NEAR via approve_with_event.
  */
 
 // ── Types ─────────────────────────────────────────────────────────────
@@ -295,11 +295,11 @@ export class RelayWatcher {
     const approverTag = event.tags.find((t) => t[0] === "approver");
     const approverIndex = approverTag?.[1] ? parseInt(approverTag[1], 10) : 0;
 
-    // Determine method from #action tag or content heuristic
+    // New TS contract has no cancel path — skip cancel events entirely
+    // (submitting would just burn gas on ERR_EVENT_ACTION).
     const actionTag = event.tags.find((t) => t[0] === "action");
-    const method = actionTag?.[1] === "cancel"
-      ? "cancel_vote_with_event"
-      : "approve_with_event";
+    if (actionTag?.[1] === "cancel") return null;
+    const method = "approve_with_event";
 
     return { method, walletName, proposalId, approverIndex };
   }
@@ -462,18 +462,17 @@ export class RelayWatcher {
       false, ["sign"],
     );
 
-    // Build contract args — match approve_with_event / cancel_vote_with_event signature
+    // Build contract args — pass through the raw event fields; the TS
+    // contract re-serializes the event and verifies the schnorr sig on-chain.
+    // cat must be the bare created_at integer so the NIP-01 reconstruction
+    // matches what the signer serialized.
     const args = JSON.stringify({
-      wallet_name: parsed.walletName,
-      proposal_id: parsed.proposalId,
-      approver_index: parsed.approverIndex,
-      pubkey_hex: event.pubkey,
-      event_id_hex: event.id,
-      created_at: event.created_at,
-      kind: event.kind,
-      tags_json: JSON.stringify(event.tags),
-      content: event.content,
-      sig_hex: event.sig,
+      pk: event.pubkey,
+      cat: String(event.created_at),
+      kind: String(event.kind),
+      tags: JSON.stringify(event.tags),
+      ct: event.content,
+      sig: event.sig,
     });
     const argsB64 = btoa(args);
 

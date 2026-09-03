@@ -34,7 +34,7 @@ export const NEAR_RPC = "https://rpc.testnet.fastnear.com";
 export const NEAR_NETWORK_ID = "testnet";
 
 // ── nostr-msig (testnet) ──
-export const DEFAULT_TREASURY = "benchv5.vault.kampy.testnet";
+export const DEFAULT_TREASURY = "gov.anon372340656.testnet";
 
 // ── Relayer watcher ──
 export const RELAYER_WATCHER_URL = "https://nostr-relay-watcher.kj95hgdgnn.workers.dev";
