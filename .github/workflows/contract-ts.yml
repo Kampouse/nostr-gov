@@ -1,0 +1,41 @@
+name: contract-ts
+
+on:
+  push:
+    paths: ['contract-ts/**', '.github/workflows/contract-ts.yml']
+  pull_request:
+    paths: ['contract-ts/**']
+
+jobs:
+  gauntlet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone lisp-rlm toolchain
+        uses: actions/checkout@v4
+        with:
+          repository: Kampouse/lisp-rlm
+          path: lisp-rlm
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build toolchain (compiler + near-mock)
+        run: cargo build --release --bin compile --bin near-mock
+        working-directory: lisp-rlm
+
+      - name: Build contract
+        run: ./build.sh
+        env:
+          LISP_RLM_ROOT: ${{ github.workspace }}/lisp-rlm
+        working-directory: contract-ts
+
+      - name: Gauntlet (68 governance vectors)
+        run: tests/run-gauntlet.sh
+        env:
+          LISP_RLM_ROOT: ${{ github.workspace }}/lisp-rlm
+          NO_COLOR: '1'
+        working-directory: contract-ts
