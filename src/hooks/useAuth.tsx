@@ -80,6 +80,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setReadOnly(true); setAuthMode("npub");
         return;
       }
+      if (parsed.mode === "nip07" && parsed.pubkey) {
+        // extension re-prompts at sign time; pubkey is what we identity against
+        setPubkey(parsed.pubkey);
+        setReadOnly(false); setAuthMode("nip07");
+        return;
+      }
       if (parsed.nsecHex) {
         const sk = hexToBytes(parsed.nsecHex);
         setSecretKey(sk);
@@ -171,7 +177,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         created_at: Math.floor(Date.now() / 1000),
       });
     }
-    throw new Error("No signer available");
+    // NIP-07 extension (Alby / nos2x) — popups per signature
+    if ((window as any).nostr?.signEvent) {
+      return (window as any).nostr.signEvent({
+        kind: template.kind, content: template.content, tags: template.tags,
+        created_at: Math.floor(Date.now() / 1000),
+      });
+    }
+    throw new Error("No signer available — log in with nsec, bunker, or a NIP-07 extension (Alby / nos2x)");
   }, [signer, secretKey]);
 
   // ── NIP-46 pairing ──
@@ -213,6 +226,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         setSigner(s);
         setPubkey(userPk);
+        setAuthMode("nip46");
         setConnectUri("");
         setConnectHandle(null);
         setLoading(false);
@@ -245,7 +259,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!pk) throw new Error("Extension denied access");
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ mode: "nip07", pubkey: pk }));
       setPubkey(pk);
-      setReadOnly(false);
+      setReadOnly(false); setAuthMode("nip07");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "NIP-07 login failed");
     } finally { setLoading(false); }
@@ -268,7 +282,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const hexSk = Array.from(sk).map(b => b.toString(16).padStart(2, "0")).join("");
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ mode: "nsec", nsecHex: hexSk }));
       setSecretKey(sk);
-      setPubkey(pk);
+      setPubkey(pk); setAuthMode("nsec");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Invalid key");
     } finally { setLoading(false); }
@@ -287,7 +301,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } else { pk = npubOrHex; }
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ mode: "npub", pubkey: pk }));
       setPubkey(pk);
-      setReadOnly(true);
+      setReadOnly(true); setAuthMode("npub");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Invalid key");
     } finally { setLoading(false); }
@@ -302,6 +316,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setError("");
     setReadOnly(false);
     setSecretKey(null);
+    setAuthMode("");
     setSessionAlive(true);
     localStorage.removeItem(STORAGE_KEY);
   }, [signer]);

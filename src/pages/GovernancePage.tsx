@@ -969,7 +969,7 @@ function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
 // ═════════════════════════════════════════════════════════════════════════
 
 export default function GovernancePage() {
-  const { pubkey, secretKey, signEventRaw } = useAuth();
+  const { pubkey, secretKey, signEventRaw, mode } = useAuth();
   const { accountId, wallet } = useNear();
   const queryClient = useQueryClient();
   const { toasts, push } = useToasts();
@@ -981,7 +981,7 @@ export default function GovernancePage() {
   const [useRelayer, setUseRelayer] = useState(false);
 
   const signCtx: SignCtx = { secretKey, signEventRaw };
-  const canSign = Boolean(secretKey || signEventRaw);
+  const canSign = mode === "nsec" || mode === "nip07" || mode === "nip46";
 
   if (!pubkey) return <LoginScreen />;
 
