@@ -30,3 +30,7 @@ watcher/.wrangler
 watcher/*.cjs
 watcher/keys.json
 watcher/watcher-key.json
+
+# python
+__pycache__/
+*.pyc
