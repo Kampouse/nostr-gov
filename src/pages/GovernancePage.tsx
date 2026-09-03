@@ -978,7 +978,7 @@ export default function GovernancePage() {
   const [sel, setSel] = useState<{ t: string | null; w: string | null; p: string | null }>({ t: null, w: null, p: null });
   const [treasuries, setTreasuries] = useState<string[]>(getTreasuries);
   const [showCreate, setShowCreate] = useState(false);
-  const [useRelayer, setUseRelayer] = useState(false);
+  const [useRelayer, setUseRelayer] = useState(true);
 
   const signCtx: SignCtx = { secretKey, signEventRaw };
   const canSign = mode === "nsec" || mode === "nip07" || mode === "nip46";

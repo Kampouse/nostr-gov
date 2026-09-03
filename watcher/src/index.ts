@@ -16,6 +16,7 @@ interface Env {
   RELAY_URL: string;
   NEAR_SIGNER_KEY: string;
   TREASURY_CONTRACT_ID: string;
+  TREASURY_CONTRACT_IDS?: string; // comma list — supersedes TREASURY_CONTRACT_ID
   RELAY_WATCHER: DurableObjectNamespace;
 }
 
@@ -78,6 +79,17 @@ const MAX_EVENTS = 500;
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [1000, 5000, 15000];
 
+// Multi-contract support: comma list in TREASURY_CONTRACT_IDS supersedes
+// TREASURY_CONTRACT_ID. The relayer only ever submits 0-deposit calls
+// (approve_with_event, propose) — create_wallet/execute stay NEAR-wallet
+// actions so shared relayer funds can never be drained via relay events.
+const CONTRACT_IDS = (env: Env): string[] => {
+  if (env.TREASURY_CONTRACT_IDS) {
+    return env.TREASURY_CONTRACT_IDS.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  return [env.TREASURY_CONTRACT_ID];
+};
+
 // ── Durable Object ────────────────────────────────────────────────────
 
 export class RelayWatcher {
@@ -112,7 +124,7 @@ export class RelayWatcher {
       return Response.json({
         connected: this.conns.filter((c) => c.ws.readyState === WebSocket.OPEN).length,
         relays: this.conns.map((c) => ({ url: c.url, open: c.ws.readyState === WebSocket.OPEN })),
-        treasury: this.env.TREASURY_CONTRACT_ID,
+        treasury: CONTRACT_IDS(this.env),
         account: this.env.NEAR_ACCOUNT_ID,
         processed: this.processedEvents.size,
         lastError: this.lastError,
@@ -163,11 +175,11 @@ export class RelayWatcher {
 
     ws.addEventListener("open", () => {
       console.log(`[watcher] connected to ${url}, subscribing`);
-      // Subscribe to kind-37500 events tagged with our contract
+      // Subscribe to kind-37500 events tagged with any watched contract
       ws.send(JSON.stringify([
         "REQ",
         "gov-watch",
-        { kinds: [GOVERNANCE_KIND], "#contract": [this.env.TREASURY_CONTRACT_ID], limit: 100 },
+        { kinds: [GOVERNANCE_KIND], "#contract": CONTRACT_IDS(this.env), limit: 100 },
       ]));
     });
 
@@ -264,13 +276,14 @@ export class RelayWatcher {
     this.lastError = result.error;
 
     // Publish result back to all connected relays
-    this.publishResult(event, result, relayUrl);
+    this.publishResult(event, result, relayUrl, parsed.contractId);
   }
 
   // ── Parse governance event ────────────────────────────────────────
 
   private parseGovernanceEvent(event: NostrEvent): {
     method: string;
+    contractId: string;
     walletName: string;
     proposalId: number;
     approverIndex: number;
@@ -278,9 +291,10 @@ export class RelayWatcher {
     // Must be kind 37500
     if (event.kind !== GOVERNANCE_KIND) return null;
 
-    // Check #contract tag matches our treasury
+    // Check #contract tag matches ANY watched treasury
     const contractTag = event.tags.find((t) => t[0] === "contract");
-    if (!contractTag || contractTag[1] !== this.env.TREASURY_CONTRACT_ID) return null;
+    if (!contractTag || !CONTRACT_IDS(this.env).includes(contractTag[1])) return null;
+    const contractId = contractTag[1];
 
     // Extract wallet name and proposal ID from tags
     const walletTag = event.tags.find((t) => t[0] === "wallet");
@@ -301,13 +315,13 @@ export class RelayWatcher {
     if (actionTag?.[1] === "cancel") return null;
     const method = "approve_with_event";
 
-    return { method, walletName, proposalId, approverIndex };
+    return { method, contractId, walletName, proposalId, approverIndex };
   }
 
   // ── Retry logic ────────────────────────────────────────────────────
 
   private async submitWithRetry(
-    parsed: { method: string; walletName: string; proposalId: number; approverIndex: number },
+    parsed: { method: string; contractId: string; walletName: string; proposalId: number; approverIndex: number },
     event: NostrEvent,
   ): Promise<TxResult> {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -337,7 +351,7 @@ export class RelayWatcher {
   // ── Submit to NEAR ──────────────────────────────────────────────────
 
   private async submitToNear(
-    parsed: { method: string; walletName: string; proposalId: number; approverIndex: number },
+    parsed: { method: string; contractId: string; walletName: string; proposalId: number; approverIndex: number },
     event: NostrEvent,
   ): Promise<TxResult> {
     try {
@@ -377,7 +391,7 @@ export class RelayWatcher {
           break;
         }
         if (outcome.status?.SuccessValue !== undefined) {
-          if (receipt.executor_id === this.env.TREASURY_CONTRACT_ID) {
+          if (receipt.executor_id === parsed.contractId) {
             contractSuccess = true;
           }
         }
@@ -395,7 +409,7 @@ export class RelayWatcher {
 
   // ── Publish result back to relay ─────────────────────────────────────
 
-  private publishResult(event: NostrEvent, result: TxResult, _sourceRelay: string) {
+  private publishResult(event: NostrEvent, result: TxResult, _sourceRelay: string, contractId: string) {
     const status = result.ok ? "success" : "failed";
     const content = JSON.stringify({
       type: "watcher-result",
@@ -411,7 +425,7 @@ export class RelayWatcher {
       created_at: Math.floor(Date.now() / 1000),
       tags: [
         ["e", event.id],
-        ["contract", this.env.TREASURY_CONTRACT_ID],
+        ["contract", contractId],
         ["p", result.ok ? "success" : "error"],
       ],
       content,
@@ -440,7 +454,7 @@ export class RelayWatcher {
   // ── Build signed NEAR transaction ───────────────────────────────────
 
   private async buildSignedTransaction(
-    parsed: { method: string; walletName: string; proposalId: number; approverIndex: number },
+    parsed: { method: string; contractId: string; walletName: string; proposalId: number; approverIndex: number },
     event: NostrEvent,
   ): Promise<string> {
     const seed = hexToBytes(this.env.NEAR_SIGNER_KEY);
@@ -490,7 +504,7 @@ export class RelayWatcher {
       signerId: this.env.NEAR_ACCOUNT_ID,
       publicKey: pubRaw,
       nonce: BigInt(nonce) + 1n,
-      receiverId: this.env.TREASURY_CONTRACT_ID,
+      receiverId: parsed.contractId,
       actions: [{ type: "FunctionCall" as const, methodName: parsed.method, args: argsB64, gas: 30000000000000n, deposit: 0n }],
       blockHash: base58ToBytes(blockHash),
     });
