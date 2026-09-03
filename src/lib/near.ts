@@ -22,7 +22,17 @@ function decodeRpcResult(result: any): any {
   if (!raw || !raw.length) return null;
   const bytes = Uint8Array.from(raw);
   const text = new TextDecoder().decode(bytes);
-  const parsed = JSON.parse(text);
+  let parsed: any;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // v2 contract wraps OBJECT returns without escaping the inner quotes:
+    // {"result": "{"name":"stuffed",...}"} — invalid JSON, salvage the payload
+    // between the `"result": "` opener and the final `"}` closer.
+    const m = text.match(/^\s*\{\s*"result"\s*:\s*"(.*)"\s*\}\s*$/s);
+    if (!m) return null;
+    try { return JSON.parse(m[1]); } catch { return m[1]; }
+  }
   // v2 lisp-rlm contract wraps every jsonReturnStr in { result: "..." }
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)
       && "result" in parsed && Object.keys(parsed).length === 1
