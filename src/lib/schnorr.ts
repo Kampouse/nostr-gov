@@ -119,3 +119,45 @@ export const buildGovEvent = (params: {
   ],
   created_at: Math.floor(Date.now() / 1000),
 });
+
+/** Gov envelope: kind-37500 event whose SIGNED content carries the full
+ * contract args for propose/execute. The watcher whitelists methods (so
+ * create_wallet can never ride the relayer) and submits args verbatim;
+ * the contract re-verifies the admin schnorr sig over these exact bytes,
+ * so any tampering with the payload dies on-chain (ERR_EVENT_SIG_INVALID).
+ * Returns { event, args } — args are what the watcher will submit. */
+export const buildGovEnvelope = async (params: {
+  method: "propose" | "execute";
+  contractId: string;
+  walletName: string;
+  proposalId?: string; // execute only
+  expiresAt: string;
+  args: Record<string, unknown>; // full contract args incl. amount/recipient
+  signCtx: { secretKey: Uint8Array | null; signEventRaw: ((t: any) => Promise<any>) | null };
+}): Promise<{ event: any; args: Record<string, unknown> }> => {
+  const nonce = await import("./near").then((m) => m.getOwnerNonce(params.contractId));
+  const action = params.method === "execute"
+    ? `execute:${params.walletName}:${params.proposalId}`
+    : `propose:${params.walletName}:${nonce}`;
+  const payload = { ...params.args };
+  const template = buildGovEvent({
+    action,
+    nonce,
+    expiresAt: params.expiresAt,
+    contractId: params.contractId,
+    content: "gov:" + JSON.stringify({
+      v: 1,
+      method: params.method,
+      contractId: params.contractId,
+      args: payload,
+    }),
+  });
+  const { finalizeEvent } = await import("nostr-tools");
+  const signed = params.signCtx.secretKey
+    ? finalizeEvent(
+        { kind: template.kind, content: template.content, tags: template.tags, created_at: template.created_at },
+        params.signCtx.secretKey,
+      )
+    : await params.signCtx.signEventRaw!(template);
+  return { event: signed, args: payload };
+};

@@ -45,6 +45,17 @@ interface EventRecord {
   updatedAt: number;
 }
 
+// Gov envelope: a kind-37500 event whose signed content wraps the FULL
+// contract args for propose/execute. The contract re-verifies the admin
+// schnorr signature over these bytes on-chain, so tampering with any
+// field (amount, recipient...) invalidates the event.
+interface GovEnvelope {
+  v: 1;
+  method: "propose" | "execute";
+  contractId: string;
+  args: Record<string, unknown>;
+}
+
 interface RelayConn {
   ws: WebSocket;
   url: string;
@@ -80,9 +91,13 @@ const MAX_RETRIES = 3;
 const RETRY_DELAYS = [1000, 5000, 15000];
 
 // Multi-contract support: comma list in TREASURY_CONTRACT_IDS supersedes
-// TREASURY_CONTRACT_ID. The relayer only ever submits 0-deposit calls
-// (approve_with_event, propose) — create_wallet/execute stay NEAR-wallet
-// actions so shared relayer funds can never be drained via relay events.
+// TREASURY_CONTRACT_ID. 0-deposit rule: the relayer only ever submits
+// calls whose attached NEAR deposit is 0 (approve_with_event, propose,
+// execute). Payouts move the TREASURY's balance — the relayer only fronts
+// gas (<0.01 N). create_wallet (1.1 N deposit) is NOT relayable: gov
+// envelopes whitelist methods, so a relay event can never drain relayer
+// funds. The contract re-verifies the admin schnorr sig + nonce on-chain;
+// the watcher is a gas puppet that cannot forge or replay anything.
 const CONTRACT_IDS = (env: Env): string[] => {
   if (env.TREASURY_CONTRACT_IDS) {
     return env.TREASURY_CONTRACT_IDS.split(",").map((s) => s.trim()).filter(Boolean);
@@ -281,12 +296,19 @@ export class RelayWatcher {
 
   // ── Parse governance event ────────────────────────────────────────
 
+  // Two event shapes arrive on kind-37500:
+  //  A) approval events — tags [wallet, proposal, approver, action=approve,
+  //     contract] → approve_with_event
+  //  B) gov envelopes — signed content wraps {v,method,contractId,args} for
+  //     propose/execute. Content is schnorr-covered, so the watcher can
+  //     trust args match what the admin signed; the contract re-verifies.
   private parseGovernanceEvent(event: NostrEvent): {
     method: string;
     contractId: string;
     walletName: string;
     proposalId: number;
     approverIndex: number;
+    envelope: GovEnvelope | null;
   } | null {
     // Must be kind 37500
     if (event.kind !== GOVERNANCE_KIND) return null;
@@ -296,7 +318,32 @@ export class RelayWatcher {
     if (!contractTag || !CONTRACT_IDS(this.env).includes(contractTag[1])) return null;
     const contractId = contractTag[1];
 
-    // Extract wallet name and proposal ID from tags
+    // Shape B: gov envelope in signed content
+    if (event.content.startsWith("gov:")) {
+      let env: GovEnvelope;
+      try {
+        env = JSON.parse(event.content.slice(4)) as GovEnvelope;
+      } catch {
+        return null;
+      }
+      // Whitelist: only these two methods are ever relayed from envelopes,
+      // and create_wallet can never be added (it needs a 1.1 N deposit).
+      if (env?.v !== 1 || (env.method !== "propose" && env.method !== "execute")) return null;
+      // Envelope contractId must match the signed #contract tag
+      if (env.contractId !== contractId) return null;
+      const argsName = typeof env.args?.name === "string" ? env.args.name : "";
+      const argsId = Number(env.args?.id ?? NaN);
+      return {
+        method: env.method,
+        contractId,
+        walletName: argsName,
+        proposalId: env.method === "execute" ? argsId : 0,
+        approverIndex: 0,
+        envelope: env,
+      };
+    }
+
+    // Shape A: approval event
     const walletTag = event.tags.find((t) => t[0] === "wallet");
     const proposalTag = event.tags.find((t) => t[0] === "proposal");
     if (!walletTag?.[1] || !proposalTag?.[1]) return null;
@@ -315,13 +362,13 @@ export class RelayWatcher {
     if (actionTag?.[1] === "cancel") return null;
     const method = "approve_with_event";
 
-    return { method, contractId, walletName, proposalId, approverIndex };
+    return { method, contractId, walletName, proposalId, approverIndex, envelope: null };
   }
 
   // ── Retry logic ────────────────────────────────────────────────────
 
   private async submitWithRetry(
-    parsed: { method: string; contractId: string; walletName: string; proposalId: number; approverIndex: number },
+    parsed: { method: string; contractId: string; walletName: string; proposalId: number; approverIndex: number; envelope: GovEnvelope | null },
     event: NostrEvent,
   ): Promise<TxResult> {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -351,7 +398,7 @@ export class RelayWatcher {
   // ── Submit to NEAR ──────────────────────────────────────────────────
 
   private async submitToNear(
-    parsed: { method: string; contractId: string; walletName: string; proposalId: number; approverIndex: number },
+    parsed: { method: string; contractId: string; walletName: string; proposalId: number; approverIndex: number; envelope: GovEnvelope | null },
     event: NostrEvent,
   ): Promise<TxResult> {
     try {
@@ -454,7 +501,7 @@ export class RelayWatcher {
   // ── Build signed NEAR transaction ───────────────────────────────────
 
   private async buildSignedTransaction(
-    parsed: { method: string; contractId: string; walletName: string; proposalId: number; approverIndex: number },
+    parsed: { method: string; contractId: string; walletName: string; proposalId: number; approverIndex: number; envelope: GovEnvelope | null },
     event: NostrEvent,
   ): Promise<string> {
     const seed = hexToBytes(this.env.NEAR_SIGNER_KEY);
@@ -480,14 +527,19 @@ export class RelayWatcher {
     // contract re-serializes the event and verifies the schnorr sig on-chain.
     // cat must be the bare created_at integer so the NIP-01 reconstruction
     // matches what the signer serialized.
-    const args = JSON.stringify({
-      pk: event.pubkey,
-      cat: String(event.created_at),
-      kind: String(event.kind),
-      tags: JSON.stringify(event.tags),
-      ct: event.content,
-      sig: event.sig,
-    });
+    // Gov envelopes instead carry the FULL contract args in their signed
+    // content (propose/execute): the payload travels inside the signature,
+    // and the contract re-verifies the admin sig over these exact bytes.
+    const args = JSON.stringify(parsed.envelope
+      ? { ...parsed.envelope.args, ...eventAuthFields(event) }
+      : {
+          pk: event.pubkey,
+          cat: String(event.created_at),
+          kind: String(event.kind),
+          tags: JSON.stringify(event.tags),
+          ct: event.content,
+          sig: event.sig,
+        });
     const argsB64 = btoa(args);
 
     // Fetch nonce and block hash
@@ -551,6 +603,22 @@ export default {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// Event-auth fields for gov envelopes (propose/execute): identical shape
+// to the FE's eventAuthArgs — pk/ev/sig/kind/tags/ct/cat. The contract's
+// verifyOwnerEvent re-serializes these and verifies the admin schnorr sig,
+// so any mismatch between envelope args and signed bytes dies on-chain.
+function eventAuthFields(event: NostrEvent): Record<string, string> {
+  return {
+    pk: event.pubkey,
+    ev: event.id,
+    sig: event.sig,
+    kind: String(event.kind),
+    tags: JSON.stringify(event.tags),
+    ct: event.content,
+    cat: String(event.created_at),
+  };
 }
 
 // ── Borsh serialization ────────────────────────────────────────────────

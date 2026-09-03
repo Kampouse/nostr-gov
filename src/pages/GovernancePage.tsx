@@ -30,6 +30,7 @@ import {
 } from "../lib/near";
 import {
   schnorrSign, defaultExpiryNs, buildApprovalEvent, extractEventFields,
+  buildGovEnvelope,
 } from "../lib/schnorr";
 import { DEFAULT_TREASURY, RELAYER_RELAYS } from "../lib/constants";
 import { pool } from "../lib/nostr";
@@ -168,6 +169,27 @@ async function callMethodVerified(
 async function publishToRelayerRelays(event: Event): Promise<number> {
   const results = await Promise.allSettled(RELAYER_RELAYS.map((r) => pool.publish([r], event)));
   return results.filter((r) => r.status === "fulfilled").length;
+}
+
+// Sign a gov envelope (propose/execute) and publish it — the watcher picks
+// it up and submits the NEAR tx gaslessly. Payload travels in the signed
+// content, so the contract re-verifies every arg byte on-chain.
+async function proposeViaRelayer(
+  contractId: string, walletName: string,
+  p: { method: "propose" | "execute"; proposalId?: string; args: Record<string, unknown> },
+  signCtx: SignCtx,
+): Promise<number> {
+  const { buildGovEnvelope } = await import("../lib/schnorr");
+  const { event } = await buildGovEnvelope({
+    method: p.method,
+    contractId,
+    walletName,
+    proposalId: p.proposalId,
+    expiresAt: defaultExpiryNs(),
+    args: p.args,
+    signCtx,
+  });
+  return publishToRelayerRelays(event as Event);
 }
 
 // ── shared sign context type ─────────────────────────────────────────────
@@ -480,7 +502,7 @@ function TreasuryLevel({
 // ═════════════════════════════════════════════════════════════════════════
 
 function WalletLevel({
-  contractId, walletName, userNpub, onBack, onSelectProposal, canSign, signCtx, toast,
+  contractId, walletName, userNpub, onBack, onSelectProposal, canSign, signCtx, useRelayer, toast,
 }: {
   contractId: string;
   walletName: string;
@@ -489,6 +511,7 @@ function WalletLevel({
   onSelectProposal: (id: string) => void;
   canSign: boolean;
   signCtx: SignCtx;
+  useRelayer: boolean;
   toast: (kind: "ok" | "err", text: string) => void;
 }) {
   const { accountId, wallet } = useNear();
@@ -532,12 +555,19 @@ function WalletLevel({
     if (!amt || !payTo.includes(".")) return;
     setBusyPropose(true);
     try {
+      const expiresAt = defaultExpiryNs();
       const { proposalId, args } = await proposeProposal(contractId, {
-        walletName, expiresAt: defaultExpiryNs(), action: "",
+        walletName, expiresAt, action: "",
         amount: amt, recipient: payTo.trim(), token: payToken.trim(),
       }, signCtx);
-      await callMethodVerified(wallet, accountId!, contractId, "propose", args);
-      toast("ok", `Payout proposal #${proposalId} created`);
+      if (useRelayer) {
+        const ok = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
+        if (ok === 0) throw new Error("No relay accepted the event");
+        toast("ok", `Payout proposal #${proposalId} published — watcher will propose on-chain`);
+      } else {
+        await callMethodVerified(wallet, accountId!, contractId, "propose", args);
+        toast("ok", `Payout proposal #${proposalId} created`);
+      }
       setProposeMode(null); setPayAmount(""); setPayTo(""); setPayToken("");
       refresh();
     } catch (e: any) {
@@ -552,10 +582,18 @@ function WalletLevel({
     if (nps.length === 0) { toast("err", "Enter at least one 64-hex pubkey"); return; }
     setBusyPropose(true);
     try {
-      await proposeAndSend(contractId, walletName, {
-        action: "appr", newApprovers: nps.join(","), newThreshold: apprThr || "1",
-      }, signCtx, wallet, accountId!, callMethodVerified);
-      toast("ok", "Approver rotation proposed");
+      const expiresAt = defaultExpiryNs();
+      const { proposalId, args } = await proposeProposal(contractId, {
+        walletName, expiresAt, action: "appr", newApprovers: nps.join(","), newThreshold: apprThr || "1",
+      }, signCtx);
+      if (useRelayer) {
+        const ok = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
+        if (ok === 0) throw new Error("No relay accepted the event");
+        toast("ok", `Rotation #${proposalId} published — watcher will propose on-chain`);
+      } else {
+        await callMethodVerified(wallet, accountId!, contractId, "propose", args);
+        toast("ok", "Approver rotation proposed");
+      }
       setProposeMode(null); setApprInput(""); setApprThr("");
       refresh();
     } catch (e: any) {
@@ -712,21 +750,6 @@ function WalletLevel({
   );
 }
 
-// Helper: propose end-to-end (sign event + send tx) — shared by people form.
-async function proposeAndSend(
-  contractId: string, walletName: string,
-  p: { action: "appr" | "unp"; newApprovers?: string; newThreshold?: string },
-  signCtx: SignCtx, wallet: any, accountId: string,
-  send: typeof callMethodVerified,
-) {
-  const expiresAt = defaultExpiryNs();
-  const { proposalId, args } = await proposeProposal(contractId, {
-    walletName, expiresAt, action: p.action, newApprovers: p.newApprovers, newThreshold: p.newThreshold,
-  }, signCtx);
-  await send(wallet, accountId, contractId, "propose", args);
-  return proposalId;
-}
-
 // ═════════════════════════════════════════════════════════════════════════
 // Proposal level — detail + approve/execute
 // ═════════════════════════════════════════════════════════════════════════
@@ -848,6 +871,28 @@ function ProposalLevel({
     }
   };
 
+  // Gasless execute: the whole auth lives in the signed Nostr event
+  // (verifyOwnerEvent on-chain), payout comes from the treasury's balance —
+  // the relayer only fronts gas for the tx. Watcher whitelists execute.
+  const doExecuteRelay = async () => {
+    if (!p) return;
+    setBusy("relay");
+    try {
+      const ok = await proposeViaRelayer(contractId, walletName, {
+        method: "execute",
+        proposalId: p.id,
+        args: { name: walletName, id: p.id },
+      }, signCtx);
+      if (ok === 0) throw new Error("No relay accepted the event");
+      toast("ok", `Execute #${p.id} published — watcher will execute on-chain`);
+      setTimeout(refresh, 10_000);
+    } catch (e: any) {
+      toast("err", e.message?.slice(0, 180) || "relay execute failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
   if (!p) return (
     <div className="p-3">
       <button onClick={onBack} className="flex items-center gap-1 text-text3 hover:text-text text-[11px] cursor-pointer"><ChevronLeft size={13} /> {walletName}</button>
@@ -856,7 +901,7 @@ function ProposalLevel({
   );
 
   const isApprover = myIdx !== null;
-  const canExecute = p.st === "approved" && isApprover && canSign && !!wallet;
+  const canExecute = p.st === "approved" && isApprover && canSign;
 
   return (
     <div className="p-3 space-y-3">
@@ -937,12 +982,18 @@ function ProposalLevel({
           <div className="px-3 py-2 rounded-[10px] bg-surface2 border border-brd text-text4 text-[11px]">Your npub is not an approver — read-only.</div>
         )}
         {canExecute && (
-          <button onClick={doExecute} disabled={busy !== ""} className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-[10px] text-[12px] font-semibold bg-surface2 text-text border border-brd cursor-pointer hover:border-neon/50 disabled:opacity-40">
-            {busy === "execute" ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />} Execute {p.act === "" ? "payout" : p.act === "appr" ? "rotation" : "unpause"}
-          </button>
+          useRelayer ? (
+            <button onClick={doExecuteRelay} disabled={busy !== ""} className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-[10px] text-[12px] font-semibold bg-neon text-bg border-none cursor-pointer hover:brightness-110 disabled:opacity-40">
+              {busy === "relay" ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />} Execute via relayer (gasless)
+            </button>
+          ) : (
+            <button onClick={doExecute} disabled={busy !== ""} className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-[10px] text-[12px] font-semibold bg-surface2 text-text border border-brd cursor-pointer hover:border-neon/50 disabled:opacity-40">
+              {busy === "execute" ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />} Execute {p.act === "" ? "payout" : p.act === "appr" ? "rotation" : "unpause"}
+            </button>
+          )
         )}
         {p.st === "approved" && !canExecute && (
-          <div className="px-3 py-2 rounded-[10px] bg-surface2 border border-brd text-text4 text-[11px]">Threshold reached — an approver with a NEAR wallet connection can execute.</div>
+          <div className="px-3 py-2 rounded-[10px] bg-surface2 border border-brd text-text4 text-[11px]">Threshold reached — an approver with a Nostr signer can execute.</div>
         )}
         {p.st === "executed" && (
           <div className="flex items-center gap-2 px-3 py-2 rounded-[10px] bg-neon-dim border border-neon/25 text-neon text-[11px]"><Check size={12} /> Executed on-chain.</div>
@@ -1033,6 +1084,7 @@ export default function GovernancePage() {
           userNpub={pubkey}
           canSign={canSign}
           signCtx={signCtx}
+          useRelayer={useRelayer}
           toast={push}
           onBack={() => setSel({ t: sel.t, w: null, p: null })}
           onSelectProposal={(id) => setSel({ t: sel.t, w: sel.w, p: id })}
