@@ -22,6 +22,7 @@ import {
   getOwnerNpubs, getGuardianNpub, getEventNonce, getContractVersion,
   getProposalsPaginated, getSpendStats,
   getProposalMessage, getOwnerNonce, listWallets,
+  proposeProposal,
   type Wallet, type Proposal,
 } from "../lib/near";
 import { schnorrSign, defaultExpiryNs, buildOwnerMessage, buildApprovalEvent, buildGovEvent, extractEventFields } from "../lib/schnorr";
@@ -65,6 +66,14 @@ function removeTreasury(id: string) {
 
 const DEPOSIT_NEAR = 7;
 const STORAGE_DEPOSIT = "500000000000000000000000"; // 0.5 NEAR — matches contract's STORAGE_DEPOSIT_YOCTO
+
+/** NEAR → yocto (integer math only, up to 24 decimals) */
+function nearToYocto(v: string): string {
+  const m = v.trim().match(/^(\d+)(?:\.(\d{1,24}))?$/);
+  if (!m) return "";
+  const frac = (m[2] ?? "").padEnd(24, "0");
+  return (BigInt(m[1]) * 10n ** 24n + BigInt(frac || "0")).toString();
+}
 
 // ── Call a change method via the connected NEAR wallet ──
 async function callMethod(
@@ -350,7 +359,7 @@ function TreasuryCard({
                 {contractId.split(".")[0]}
               </div>
               <div className="text-text4 text-[11px] mt-0.5 truncate max-w-[240px]">
-                {contractId}{meta ? ` · v${meta.version} · ${meta.walletCount} wallet${meta.walletCount !== 1 ? "s" : ""}` : " · loading…"}
+                {contractId}{meta ? ` · v${String(meta.version)} · ${String(meta.walletCount)} wallet${Number(meta.walletCount) !== 1 ? "s" : ""}` : " · loading…"}
                 {isOwner && " · "}<span className={isOwner ? "text-neon" : ""}>{isOwner ? "Owner" : "Viewer"}</span>
               </div>
             </div>
@@ -460,6 +469,14 @@ function WalletDetail({
   const [actionError, setActionError] = useState("");
   const [useRelayer, setUseRelayer] = useState(false);
   const [relayerStatus, setRelayerStatus] = useState<"idle" | "publishing" | "submitted">("idle");
+  const [showProposeForm, setShowProposeForm] = useState(false);
+  const [proposingId, setProposingId] = useState<string | null>(null);
+  const [payoutAmount, setPayoutAmount] = useState("");
+  const [payoutTo, setPayoutTo] = useState("");
+  const [newApproversInput, setNewApproversInput] = useState("");
+  const [newThresholdInput, setNewThresholdInput] = useState("");
+  const [newProposalId, setNewProposalId] = useState<string | null>(null);
+  const [proposeMode, setProposeMode] = useState<"payout" | "people">("payout");
 
   const { data: balance } = useQuery({
     queryKey: ["wal-bal", contractId, walletName],
@@ -622,6 +639,33 @@ function WalletDetail({
     }
   };
 
+  const handlePropose = async (p: { amount?: string; recipient?: string; newApprovers?: string; newThreshold?: string }) => {
+    if ((!secretKey && !signEventRaw) || !walletObj) return;
+    setProposingId("new");
+    setActionError("");
+    try {
+      const expiresAt = defaultExpiryNs();
+      const { proposalId, args } = await proposeProposal(contractId, {
+        walletName,
+        expiresAt,
+        amount: p.amount,
+        recipient: p.recipient,
+        newApprovers: p.newApprovers,
+        newThreshold: p.newThreshold,
+      }, { secretKey, signEventRaw });
+      await callMethod(walletObj, contractId, "propose", args);
+      setNewProposalId(proposalId);
+      setShowProposeForm(false);
+      setPayoutAmount(""); setPayoutTo(""); setNewApproversInput(""); setNewThresholdInput("");
+      queryClient.invalidateQueries({ queryKey: ["wal-props"] });
+      queryClient.invalidateQueries({ queryKey: ["wal-state"] });
+    } catch (e: any) {
+      setActionError(e.message || "Propose failed");
+    } finally {
+      setProposingId(null);
+    }
+  };
+
   const handleExecute = async (proposal: Proposal) => {
     if (!secretKey || !walletObj) return;
 
@@ -696,27 +740,133 @@ function WalletDetail({
             </div>
           </div>
 
+          {/* Approver roster */}
+          {approverPks.length > 0 && (
+            <div className="mt-3 px-1">
+              <div className="text-text4 text-[10px] mb-1">
+                approvers · {threshold} of {approverPks.length} required
+              </div>
+              {approverPks.map((pk, i) => (
+                <div key={`${pk}-${i}`} className="flex items-center gap-2 py-0.5">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${userNpub === pk ? "bg-neon" : "bg-text4/40"}`} />
+                  <span className="text-text3 text-[11px] font-mono truncate">{pk.slice(0, 16)}…{pk.slice(-8)}</span>
+                  {userNpub === pk && <span className="text-neon text-[10px]">you</span>}
+                  {isOwner && userNpub === pk && <span className="text-text4 text-[10px]">· can propose + execute</span>}
+                </div>
+              ))}
+            </div>
+          )}
+
           {!canSign && isOwner && (
             <div className="flex items-center gap-1.5 mt-3 px-2 py-2 rounded-[8px] bg-yellow/5 border border-yellow/20 text-yellow text-[11px]">
               <AlertTriangle size={12} />
               Connect with nsec or a NIP-46 bunker to approve proposals
             </div>
           )}
+          {!isOwner && (
+            <div className="text-text4 text-[10px] mt-3 px-2">
+              Read-only — only the wallet's approvers can act here.
+            </div>
+          )}
 
-          {canSign && isOwner && (
+          {canSign && isOwner && walletObj && (
             <div className="flex items-center justify-between mt-3 px-2 py-1.5">
               <button
-                onClick={() => setUseRelayer(!useRelayer)}
-                className={`flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-[6px] border cursor-pointer transition-colors ${useRelayer ? "text-neon border-neon/30 bg-neon/5" : "text-text4 border-brd hover:border-neon/20"}`}
+                onClick={() => setShowProposeForm(!showProposeForm)}
+                className={`flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-[6px] border cursor-pointer transition-colors ${showProposeForm ? "text-neon border-neon/30 bg-neon/5" : "text-text4 border-brd hover:border-neon/20"}`}
               >
-                <Zap size={10} />
-                Relayer
+                <Plus size={10} />
+                Propose
               </button>
-              {useRelayer && relayerStatus === "submitted" && (
-                <span className="text-neon text-[10px]">Published, waiting for watcher…</span>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setUseRelayer(!useRelayer)}
+                  className={`flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-[6px] border cursor-pointer transition-colors ${useRelayer ? "text-neon border-neon/30 bg-neon/5" : "text-text4 border-brd hover:border-neon/20"}`}
+                >
+                  <Zap size={10} />
+                  Relayer
+                </button>
+                {useRelayer && relayerStatus === "submitted" && (
+                  <span className="text-neon text-[10px]">Published, waiting for watcher…</span>
+                )}
+                {useRelayer && relayerStatus === "publishing" && (
+                  <span className="text-yellow text-[10px] flex items-center gap-1"><Loader2 size={10} className="animate-spin" /> Publishing…</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {canSign && isOwner && showProposeForm && (
+            <div className="mt-2 p-3 border border-brd rounded-[10px] bg-bg">
+              <div className="flex gap-1 mb-3">
+                {(["payout", "people"] as const).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setProposeMode(m)}
+                    className={`text-[10px] px-2 py-1 rounded-[6px] border cursor-pointer transition-colors ${proposeMode === m ? "text-neon border-neon/30 bg-neon/5" : "text-text4 border-brd hover:border-neon/20"}`}
+                  >
+                    {m === "payout" ? "Payout" : "People"}
+                  </button>
+                ))}
+              </div>
+
+              {proposeMode === "payout" ? (
+                <div className="space-y-2">
+                  <input
+                    value={payoutAmount}
+                    onChange={(e) => setPayoutAmount(e.target.value.replace(/[^0-9.]/g, ""))}
+                    placeholder="amount in Ⓝ, e.g. 1.5"
+                    className="w-full px-3 py-1.5 rounded-[8px] bg-surface border border-brd text-text text-[12px] placeholder:text-text4 outline-none focus:border-neon/50"
+                  />
+                  <input
+                    value={payoutTo}
+                    onChange={(e) => setPayoutTo(e.target.value.trim())}
+                    placeholder="recipient.testnet"
+                    className="w-full px-3 py-1.5 rounded-[8px] bg-surface border border-brd text-text text-[12px] placeholder:text-text4 outline-none focus:border-neon/50 font-mono"
+                  />
+                  <button
+                    onClick={() => handlePropose({ amount: nearToYocto(payoutAmount), recipient: payoutTo })}
+                    disabled={proposingId === "new" || !nearToYocto(payoutAmount) || !payoutTo.includes(".")}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[8px] text-[11px] font-semibold bg-neon text-bg border-none cursor-pointer hover:brightness-110 disabled:opacity-40"
+                  >
+                    {proposingId === "new" ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                    Propose payout
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <textarea
+                    value={newApproversInput}
+                    onChange={(e) => setNewApproversInput(e.target.value)}
+                    placeholder={"approvers, one 64-hex npub per line"}
+                    className="w-full px-3 py-1.5 rounded-[8px] bg-surface border border-brd text-text text-[12px] placeholder:text-text4 outline-none focus:border-neon/50 font-mono"
+                    rows={3}
+                  />
+                  <input
+                    value={newThresholdInput}
+                    onChange={(e) => setNewThresholdInput(e.target.value.replace(/[^0-9]/g, ""))}
+                    placeholder={`threshold, 1-${newApproversInput.split("\n").filter(s => s.trim()).length || 1}`}
+                    className="w-full px-3 py-1.5 rounded-[8px] bg-surface border border-brd text-text text-[12px] placeholder:text-text4 outline-none focus:border-neon/50"
+                  />
+                  <button
+                    onClick={() => handlePropose({
+                      newApprovers: newApproversInput.split("\n").map(s => s.trim()).filter(Boolean).join(","),
+                      newThreshold: newThresholdInput || "1",
+                    })}
+                    disabled={proposingId === "new" || newApproversInput.split("\n").filter(s => s.trim()).length === 0}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[8px] text-[11px] font-semibold bg-neon text-bg border-none cursor-pointer hover:brightness-110 disabled:opacity-40"
+                  >
+                    {proposingId === "new" ? <Loader2 size={11} className="animate-spin" /> : <Plus size={11} />}
+                    Propose rotation
+                  </button>
+                  <div className="text-text4 text-[10px] mt-1">
+                    Replaces this wallet's approver set with the listed npubs. Current approvers must approve it
+                    (threshold {threshold} of {approverPks.length}).
+                  </div>
+                </div>
               )}
-              {useRelayer && relayerStatus === "publishing" && (
-                <span className="text-yellow text-[10px] flex items-center gap-1"><Loader2 size={10} className="animate-spin" /> Publishing…</span>
+              {newProposalId && (
+                <div className="text-neon text-[10px] mt-2">Proposal #{newProposalId} created — needs {threshold} approval{threshold !== 1 ? "s" : ""} before execute.</div>
               )}
             </div>
           )}
@@ -773,16 +923,7 @@ function WalletDetail({
                         <Check size={10} /> You approved
                       </span>
                     )}
-                    {alreadyApproved && !isApproved && !isExecuted && canSign && myApproverIdx !== null && useRelayer && (
-                      <button
-                        onClick={() => handleApprove(p, true)}
-                        disabled={approvingId === p.id}
-                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-[8px] text-[11px] font-medium bg-red/10 text-red border border-red/25 cursor-pointer hover:bg-red/20 disabled:opacity-50"
-                      >
-                        Cancel
-                      </button>
-                    )}
-                    {isApproved && !isExecuted && canSign && (
+                    {isApproved && !isExecuted && canSign && walletObj && (
                       <button
                         onClick={() => handleExecute(p)}
                         disabled={executingId === p.id}

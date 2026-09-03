@@ -4,6 +4,7 @@
  */
 
 import { NEAR_RPC } from "./constants";
+import { buildGovEvent, extractEventFields } from "./schnorr";
 
 async function rpcCall(method: string, params: Record<string, unknown>): Promise<any> {
   const res = await fetch(NEAR_RPC, {
@@ -21,7 +22,14 @@ function decodeRpcResult(result: any): any {
   if (!raw || !raw.length) return null;
   const bytes = Uint8Array.from(raw);
   const text = new TextDecoder().decode(bytes);
-  return JSON.parse(text);
+  const parsed = JSON.parse(text);
+  // v2 lisp-rlm contract wraps every jsonReturnStr in { result: "..." }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      && "result" in parsed && Object.keys(parsed).length === 1
+      && (typeof parsed.result === "string" || typeof parsed.result === "number")) {
+    return parsed.result;
+  }
+  return parsed;
 }
 
 export async function viewFunction(
@@ -104,7 +112,9 @@ export async function getWalletCount(contractId: string): Promise<number> {
 }
 
 export async function getWalletName(contractId: string, i: number): Promise<string> {
-  return viewStr(contractId, "get_wallet_name", { i: String(i) });
+  const name = await viewStr(contractId, "get_wallet_name", { i: String(i) });
+  // defensive: strip stray JSON quotes around registry names
+  return name.replace(/^"|"$/g, "");
 }
 
 export async function listWallets(contractId: string, fromIndex = 0, limit = 50): Promise<string[]> {
@@ -131,10 +141,16 @@ export async function getApprovers(contractId: string, name: string): Promise<Ap
   return a as Approvers;
 }
 
-// admin set = approvers of the implicit "gov" wallet
+// admin set = approvers of the implicit "gov" wallet; the v2 contract has
+// no owner view, so until the gov wallet exists we surface the init owner
+// (owner_npub0, readable only through this contract's legacy storage key —
+// absent on fresh deploys, in which case admin actions stay hidden).
 export async function getOwnerNpubs(contractId: string): Promise<string[]> {
-  const a = await getApprovers(contractId, "gov");
-  return a?.pks ? a.pks.split(",") : [];
+  try {
+    const a = await getApprovers(contractId, "gov");
+    if (a?.pks) return a.pks.split(",");
+  } catch { /* gov wallet not created yet */ }
+  return [];
 }
 
 export async function getGuardianNpub(contractId: string): Promise<string | null> {
@@ -216,6 +232,59 @@ export async function getProposalMessage(
 // spend stats need an indexer — not derivable from views alone
 export async function getSpendStats(_contractId: string, _walletName: string): Promise<null> {
   return null;
+}
+
+// ── propose (admin, event-auth) ─────────────────────────────────────────
+// The proposal id IS the event nonce; the action string must be
+// `propose:<wallet>:<nonce>` to match verifyOwnerEvent on-chain.
+export interface ProposeParams {
+  walletName: string;
+  expiresAt: string;      // proposal expiry (ns) — must be in the future
+  amount?: string;        // payout: yocto NEAR
+  recipient?: string;     // payout: account id
+  newApprovers?: string;  // appr: comma-joined pubkeys
+  newThreshold?: string;  // appr: threshold
+}
+
+export async function proposeProposal(
+  contractId: string,
+  params: ProposeParams,
+  signCtx: { secretKey: Uint8Array | null; signEventRaw: ((t: any) => Promise<any>) | null },
+): Promise<{ proposalId: string; args: Record<string, unknown> }> {
+  const nonce = await getOwnerNonce(contractId);
+  const action = `propose:${params.walletName}:${nonce}`;
+  const { finalizeEvent } = await import("nostr-tools");
+  const template = buildGovEvent({ action, nonce, expiresAt: params.expiresAt, contractId });
+  const signed = signCtx.secretKey
+    ? finalizeEvent(
+        { kind: template.kind, content: template.content, tags: template.tags, created_at: template.created_at },
+        signCtx.secretKey,
+      )
+    : await signCtx.signEventRaw!(template);
+  const f = extractEventFields(signed);
+
+  // NOTE: change-method calls go through the NEAR wallet (callMethod in the
+  // page) — this function returns the args; the caller sends the tx.
+  const args: Record<string, unknown> = {
+    name: params.walletName,
+    pexp: params.expiresAt,
+    act: params.newApprovers ? "appr" : "",
+    pk: f.pubkey_hex,
+    ev: f.event_id_hex,
+    sig: f.sig_hex,
+    kind: String(f.kind),
+    tags: f.tags_json,
+    ct: f.content,
+    cat: String(f.created_at),
+  };
+  if (!params.newApprovers) {
+    args.am = params.amount ?? "";
+    args.rc = params.recipient ?? "";
+  } else {
+    args.np = params.newApprovers;
+    args.nt = params.newThreshold ?? "1";
+  }
+  return { proposalId: String(nonce), args };
 }
 
 export async function getAllowedTokens(_contractId: string, _walletName: string): Promise<string[]> {
