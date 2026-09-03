@@ -27,6 +27,8 @@ jobs:
       - name: Build toolchain (compiler + near-mock)
         run: cargo build --release --bin compile --bin near-mock
         working-directory: lisp-rlm
+        env:
+          RUSTFLAGS: "" # setup-rust-toolchain defaults to -D warnings; lisp-rlm has known style warns
 
       - name: Build contract
         run: ./build.sh
