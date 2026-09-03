@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+*.cjs
+keys.json
+.DS_Store
+watcher-key.json

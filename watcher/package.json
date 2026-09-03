@@ -1,0 +1,1 @@
+{"name":"nostr-relay-watcher","version":"0.1.0","private":true,"type":"module","scripts":{"dev":"wrangler dev","deploy":"wrangler deploy"},"dependencies":{"nostr-tools":"^2.25.1","tweetnacl":"^1.0.3"},"devDependencies":{"@cloudflare/workers-types":"^5.20260831.1","typescript":"^5.8.0","wrangler":"^4.20.0"}}
