@@ -25,7 +25,7 @@ import {
   type Wallet, type Proposal,
 } from "../lib/near";
 import { schnorrSign, defaultExpiryNs, buildOwnerMessage, buildApprovalEvent, buildGovEvent, extractEventFields } from "../lib/schnorr";
-import { NEAR_RPC, RELAYER_RELAYS } from "../lib/constants";
+import { DEFAULT_TREASURY, NEAR_RPC, RELAYER_RELAYS } from "../lib/constants";
 import { pool } from "../lib/nostr";
 import type { Event } from "nostr-tools";
 import { LoginScreen } from "../components/LoginScreen";
@@ -45,18 +45,22 @@ function timeAgo(ts: number): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-// LocalStorage for user's treasury list
+// LocalStorage for user's treasury list — the baked-in treasury always
+// leads the list and can't be removed (removeTreasury is a no-op for it).
 function getTreasuries(): string[] {
-  try { return JSON.parse(localStorage.getItem("nostrgov-treasuries") || "[]"); }
-  catch { return []; }
+  let list: string[] = [];
+  try { list = JSON.parse(localStorage.getItem("nostrgov-treasuries") || "[]"); }
+  catch { list = []; }
+  if (!list.includes(DEFAULT_TREASURY)) list.unshift(DEFAULT_TREASURY);
+  return list;
 }
 function saveTreasury(id: string) {
   const list = getTreasuries();
   if (!list.includes(id)) { list.push(id); localStorage.setItem("nostrgov-treasuries", JSON.stringify(list)); }
 }
 function removeTreasury(id: string) {
-  const list = getTreasuries().filter(t => t !== id);
-  localStorage.setItem("nostrgov-treasuries", JSON.stringify(list));
+  if (id === DEFAULT_TREASURY) return;
+  localStorage.setItem("nostrgov-treasuries", JSON.stringify(getTreasuries().filter(t => t !== id)));
 }
 
 const DEPOSIT_NEAR = 7;
@@ -102,8 +106,6 @@ export default function GovernancePage() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
   const [treasuries, setTreasuries] = useState<string[]>(getTreasuries);
-  const [showAddForm, setShowAddForm] = useState(false);
-  const [addContractId, setAddContractId] = useState("");
   const [newName, setNewName] = useState("");
   const [newWalletName, setNewWalletName] = useState("");
   const [creatingWallet, setCreatingWallet] = useState(false);
@@ -144,15 +146,6 @@ export default function GovernancePage() {
       setCreating(false);
     }
   }, [accountId, wallet, pubkey, newName, queryClient]);
-
-  const handleAddTreasury = useCallback(() => {
-    if (!addContractId.trim()) return;
-    saveTreasury(addContractId.trim());
-    setTreasuries(getTreasuries());
-    setAddContractId("");
-    setShowAddForm(false);
-    queryClient.invalidateQueries({ queryKey: ["treasury"] });
-  }, [addContractId, queryClient]);
 
   const createWallet = useCallback(async (contractId: string) => {
     if (!wallet || !secretKey || !pubkey || !newWalletName.trim()) return;
@@ -203,13 +196,6 @@ export default function GovernancePage() {
         <h1 className="text-[18px] font-bold">Governance</h1>
         <div className="flex items-center gap-1">
           <button
-            onClick={() => setShowAddForm(!showAddForm)}
-            className="p-2 rounded-[10px] text-text3 hover:text-text hover:bg-surface2 transition-colors"
-            title="Add existing treasury"
-          >
-            <Plus size={14} />
-          </button>
-          <button
             onClick={() => queryClient.invalidateQueries({ queryKey: ["treasury"] })}
             className="p-2 rounded-[10px] text-text3 hover:text-text hover:bg-surface2 transition-colors"
           >
@@ -248,47 +234,15 @@ export default function GovernancePage() {
         </div>
       )}
 
-      {/* Add existing treasury form */}
-      {showAddForm && (
-        <div className="px-4 py-3 border-b border-brd shrink-0">
-          <div className="flex gap-2">
-            <input
-              value={addContractId}
-              onChange={(e) => setAddContractId(e.target.value)}
-              placeholder="contract-id.testnet"
-              className="flex-1 min-w-0 px-3 py-2 rounded-[10px] bg-bg border border-brd text-text text-[13px] placeholder:text-text4 outline-none focus:border-neon/50 font-mono"
-            />
-            <button
-              onClick={handleAddTreasury}
-              disabled={!addContractId.includes(".")}
-              className="px-4 py-2 rounded-[10px] text-[12px] font-semibold bg-surface2 text-text border border-brd cursor-pointer hover:border-neon/50 disabled:opacity-40"
-            >
-              Add
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* Treasury list */}
       <div className="p-2">
-        {treasuries.length === 0 ? (
-          <div className="px-4 py-16 text-text3 text-[13px] text-center">
-            <Landmark size={32} className="mx-auto mb-2 opacity-40" />
-            <p>No treasuries yet.</p>
-            <p className="text-text4 text-[11px] mt-1">
-              {accountId
-                ? `Create one from your account (${accountId}).`
-                : "Connect NEAR wallet + Nostr to create a treasury."}
-            </p>
-          </div>
-        ) : (
-          treasuries.map((contractId) => (
+        {treasuries.map((contractId) => (
             <TreasuryCard
               key={contractId}
               contractId={contractId}
               isExpanded={expanded === contractId}
               onToggle={() => setExpanded(expanded === contractId ? null : contractId)}
-              onRemove={() => { removeTreasury(contractId); setTreasuries(getTreasuries()); }}
+              onRemove={contractId === DEFAULT_TREASURY ? null : () => { removeTreasury(contractId); setTreasuries(getTreasuries()); }}
               userNpub={pubkey}
               canSign={canSign}
               signEventRaw={signEventRaw}
@@ -311,8 +265,7 @@ export default function GovernancePage() {
                 }, { deposit: BigInt(STORAGE_DEPOSIT) });
               }}
             />
-          ))
-        )}
+          ))}
       </div>
     </div>
   );
@@ -335,7 +288,7 @@ function TreasuryCard({
   contractId: string;
   isExpanded: boolean;
   onToggle: () => void;
-  onRemove: () => void;
+  onRemove: (() => void) | null;
   userNpub: string;
   canSign: boolean;
   secretKey: Uint8Array | null;
@@ -404,13 +357,15 @@ function TreasuryCard({
           </div>
           <ChevronRight size={16} className={`text-text4 transition-transform ${isExpanded ? "rotate-90" : ""}`} />
         </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onRemove(); }}
-          className="p-2 rounded-[10px] text-text4 hover:text-red hover:bg-red/10 transition-colors"
-          title="Remove from list"
-        >
-          <Trash2 size={14} />
-        </button>
+        {onRemove && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onRemove(); }}
+            className="p-2 rounded-[10px] text-text4 hover:text-red hover:bg-red/10 transition-colors"
+            title="Remove from list"
+          >
+            <Trash2 size={14} />
+          </button>
+        )}
       </div>
 
       {isExpanded && (
