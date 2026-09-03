@@ -58,7 +58,7 @@ function removeTreasury(id: string) {
   localStorage.setItem("nostrgov-treasuries", JSON.stringify(getTreasuries().filter(t => t !== id)));
 }
 
-const DEPOSIT_NEAR = 7;
+const DEPOSIT_NEAR = 3;
 const STORAGE_DEPOSIT = "500000000000000000000000"; // 0.5 NEAR — matches contract's STORAGE_DEPOSIT_YOCTO
 
 /** NEAR → yocto (integer math only, up to 24 decimals) */
