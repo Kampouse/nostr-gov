@@ -241,11 +241,15 @@ export class RelayWatcher {
 
     ws.addEventListener("open", () => {
       console.log(`[watcher] connected to ${url}, subscribing`);
-      // Subscribe to kind-37500 events tagged with any watched contract
+      // Subscribe to nostr-gov events. IMPORTANT: filter on the #t tag,
+      // NOT #contract — NIP-01 only requires relays to index single-letter
+      // tags; multi-letter filters like #contract are unindexed (primal
+      // silently returns nothing, nos.lol rejects the REQ outright).
+      // parseGovernanceEvent content-filters by the #contract tag anyway.
       ws.send(JSON.stringify([
         "REQ",
         "gov-watch",
-        { kinds: [GOVERNANCE_KIND], "#contract": CONTRACT_IDS(this.env), limit: 100 },
+        { kinds: [GOVERNANCE_KIND], "#t": ["nostr-gov"], limit: 100 },
       ]));
     });
 
@@ -297,6 +301,12 @@ export class RelayWatcher {
       this.handleGovernanceEvent(event, relayUrl);
     } else if (type === "EOSE") {
       console.log(`[watcher] caught up on ${relayUrl}`);
+    } else if (type === "CLOSED") {
+      // A relay rejecting our subscription is fatal for that path —
+      // surface it; without this the failure is completely silent.
+      const reason = String(msg[2] ?? "").slice(0, 120);
+      console.log(`[watcher] subscription CLOSED by ${relayUrl}: ${reason}`);
+      this.lastError = `sub closed by ${relayUrl}: ${reason}`;
     }
   }
 

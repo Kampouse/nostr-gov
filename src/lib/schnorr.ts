@@ -61,6 +61,10 @@ export const buildApprovalEvent = (params: {
 }): NostrEventTemplate => {
   const { pubkey, proposalMessage, contractId, walletName, proposalId, approverIndex, action } = params;
   const tags: string[][] = [
+    // t tag first: single-letter tags are relay-indexed — the watcher's
+    // subscription filters on #t nostr-gov (multi-letter #contract is not
+    // indexed by major relays, so the relayer path would never see it)
+    ["t", "nostr-gov"],
     ["contract", contractId],
     ["wallet", walletName],
     ["proposal", String(proposalId)],
