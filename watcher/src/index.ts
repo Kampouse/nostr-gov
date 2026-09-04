@@ -471,8 +471,13 @@ export class RelayWatcher {
         return new TxResult(false, null, detail ? `${msg}: ${detail}` : msg, null);
       }
 
-      const txHash: string = data.result?.transaction_hash ?? null;
-      const execStatus = data.result?.status?.FinalExecutionStatus;
+      const txHash: string = data.result?.transaction_hash ?? data.result?.transaction_outcome?.id ?? null;
+      // Providers differ: standard RPCs nest the final status as
+      // status.FinalExecutionStatus; fastnear returns final_execution_status
+      // at the top level and puts SuccessValue directly on result.status,
+      // with receipts lacking executor_id.
+      const execStatus = data.result?.status?.FinalExecutionStatus ?? data.result?.final_execution_status;
+      const flatSuccess = data.result?.status?.SuccessValue !== undefined;
       const receipts = data.result?.receipts_outcome ?? [];
 
       let contractSuccess: boolean | null = null;
@@ -495,7 +500,12 @@ export class RelayWatcher {
         }
       }
 
-      const ok = execStatus === "FINAL" || execStatus === "EXECUTED_OPTIMISTIC";
+      // ok when the provider reports a final status, or — when the status
+      // field is in the flat/legacy shape — when the single function call
+      // returned a value (SuccessValue present) or a receipt proved the
+      // contract call succeeded (receipt executor match).
+      const ok = execStatus === "FINAL" || execStatus === "EXECUTED_OPTIMISTIC"
+        || (execStatus === undefined && (flatSuccess || contractSuccess === true));
       const error = contractSuccess === false ? contractError : (!ok ? `status: ${execStatus}` : null);
 
       return new TxResult(ok, txHash, error, contractSuccess);

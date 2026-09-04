@@ -162,6 +162,18 @@ function nthField(s: string, k: number) {
 
 const EMPTY = "";
 
+// Sentinel protocol (2026-09-03): the host jsonGetStr copies raw bytes up
+// to the first quote, so arg values containing escaped quotes (tags JSON,
+// envelope content) arrive truncated/corrupted. Senders therefore replace
+// every double-quote in tags/ct with "~" (never present in event bytes)
+// and unsentinel() restores them byte-exact before verification.
+// NOTE: defined before first use — the TS frontend resolves calls
+// top-down and rejects forward references.
+function unquote(): string {
+  // jsonQuote wraps in literal quotes; slice one off as the quote char
+  return strSlice(jsonQuote(EMPTY), 0, 1);
+}
+
 function tagGet(tags: string, key: string): string {
   const nd = `["${key}","`;
   const i = strIndexOf(tags, nd);
@@ -186,16 +198,6 @@ function tagNonce(tags: string) {
 }
 function tagExpires(tags: string) {
   return tagGet(tags, "expires");
-}
-
-// Sentinel protocol (2026-09-03): the host jsonGetStr copies raw bytes up
-// to the first quote, so arg values containing escaped quotes (tags JSON,
-// envelope content) arrive truncated/corrupted. Senders therefore replace
-// every double-quote in tags/ct with "~" (never present in event bytes)
-// and unsentinel() restores them byte-exact before verification.
-function unquote(): string {
-  // jsonQuote wraps in literal quotes; slice one off as the quote char
-  return strSlice(jsonQuote(EMPTY), 0, 1);
 }
 
 function unsentinel(s: string): string {
@@ -443,7 +445,7 @@ export function propose() {
   walletLiveCheck(name0);
   // proposal id = the event NONCE (2026-09-02): unique, signed inside
   // the action tag, replay-protected — no pi:<name> counter write
-  const id0 = tagNonce(near.jsonGetStr("tags") ?? "");
+  const id0 = tagNonce(unsentinel(near.jsonGetStr("tags") ?? ""));
   if (strLength(id0) === 0) {
     die("ERR_EVENT_NONCE");
   }
@@ -460,7 +462,7 @@ export function propose() {
   const np = near.jsonGetStr("np") ?? "";
   const nt = near.jsonGetStr("nt") ?? "";
   const ts = near.blockTimestamp();
-  const id = tagNonce(near.jsonGetStr("tags") ?? "");
+  const id = tagNonce(unsentinel(near.jsonGetStr("tags") ?? ""));
   if (u128.lt(pexp, toStr(ts))) {
     die("ERR_EXPIRED");
   }
