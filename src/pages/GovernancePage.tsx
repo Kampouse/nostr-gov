@@ -25,7 +25,7 @@ import {
   viewFunction, getWallet, getWalletNearBalance, getWalletState,
   getOwnerNpubs, getEventNonce, getContractVersion, isPaused,
   getProposalsPaginated, getProposalMessage, listWallets,
-  proposeProposal, signGovEvent, verifyTxSuccess,
+  proposeProposal, signGovEvent, verifyTxSuccess, withTimeout,
   type Wallet, type Proposal,
 } from "../lib/near";
 import {
@@ -167,7 +167,14 @@ async function callMethodVerified(
 }
 
 async function publishToRelayerRelays(event: Event): Promise<{ relays: number; via: "relays" | "ingest" }> {
-  const results = await Promise.allSettled(RELAYER_RELAYS.map((r) => pool.publish([r], event)));
+  // Per-relay timeout: a socket that neither opens nor errors (hang) would
+  // stall allSettled forever and the ingest fallback would never fire —
+  // exact live failure: sign OK, "GET wss://nos.lol/", then silence.
+  // pool.publish returns Promise<string>[] (one promise PER RELAY) — index
+  // [0] to get the actual promise; feeding the array to allSettled made it
+  // resolve instantly as "fulfilled" and the ingest fallback never fired.
+  const publishes: Array<Promise<unknown>> = RELAYER_RELAYS.map((r) => withTimeout(pool.publish([r], event)[0], 6000));
+  const results = await Promise.allSettled(publishes);
   const ok = results.filter((r) => r.status === "fulfilled").length;
   if (ok > 0) return { relays: ok, via: "relays" };
   // Relay fallback: direct POST to the watcher's ingest endpoint. The

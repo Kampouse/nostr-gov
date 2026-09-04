@@ -135,6 +135,21 @@ export class RelayWatcher {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
+    // CORS preflight: the FE (nostr-gov.pages.dev) POSTs JSON to /ingest,
+    // so browsers send OPTIONS first — without this the browser kills the
+    // POST before it ever reaches the worker (seen live: events vanished).
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
     if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({
         connected: this.conns.filter((c) => c.ws.readyState === WebSocket.OPEN).length,
@@ -172,25 +187,33 @@ export class RelayWatcher {
     // the contract verifies the schnorr sig on-chain. The event id is
     // recomputed to reject garbage before any gas is spent.
     if (request.method === "POST" && url.pathname === "/ingest") {
+      // CORS on the POST response itself: without allow-origin the browser
+      // delivers the event but hides the response from JS — the FE would
+      // report failure for an ingest that actually succeeded.
+      const cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+      };
       try {
         const body = await request.json() as { event?: NostrEvent };
         const event = body?.event;
         if (!event || typeof event.id !== "string" || event.kind !== GOVERNANCE_KIND) {
-          return Response.json({ ok: false, error: "not a kind-37500 event" }, { status: 400 });
+          return Response.json({ ok: false, error: "not a kind-37500 event" }, { status: 400, headers: cors });
         }
         const recomputed = await sha256Hex(nip01Serialize(event));
         if (recomputed !== event.id) {
-          return Response.json({ ok: false, error: "event id mismatch" }, { status: 400 });
+          return Response.json({ ok: false, error: "event id mismatch" }, { status: 400, headers: cors });
         }
         if (!/^[0-9a-f]{128}$/.test(event.sig ?? "")) {
-          return Response.json({ ok: false, error: "bad sig field" }, { status: 400 });
+          return Response.json({ ok: false, error: "bad sig field" }, { status: 400, headers: cors });
         }
         this.handleGovernanceEvent(event, "ingest").catch((e) => {
           this.lastError = String(e);
         });
-        return Response.json({ ok: true, queued: true });
+        return Response.json({ ok: true, queued: true }, { headers: cors });
       } catch (e) {
-        return Response.json({ ok: false, error: String(e) }, { status: 400 });
+        return Response.json({ ok: false, error: String(e) }, { status: 400, headers: cors });
       }
     }
 

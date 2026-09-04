@@ -207,8 +207,9 @@ export class NdkNostrSigner {
     });
 
     // Broadcast — mirrors Dart's broadcast.broadcast()
+    // pool.publish returns Promise<string>[] (one promise per relay) — [0]
     const publishResults = await Promise.allSettled(
-      this.relays.map(r => this.pool.publish([r], signed)),
+      this.relays.map(r => this.pool.publish([r], signed)[0]),
     );
     const published = publishResults.filter(r => r.status === "fulfilled").length;
     console.log("[NIP-46] published to", published + "/" + this.relays.length, "relays");

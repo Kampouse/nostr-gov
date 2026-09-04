@@ -161,6 +161,16 @@ export async function getEventNonce(contractId: string): Promise<number> {
   return getOwnerNonce(contractId);
 }
 
+/** Race a promise against a timeout — turns a hung relay publish into a
+ * rejection so Promise.allSettled resolves and the ingest fallback fires
+ * (live bug: publish never settled, fallback never ran). */
+export function withTimeout(p: Promise<unknown>, ms: number): Promise<unknown> {
+  return Promise.race([
+    p,
+    new Promise<never>((_, rej) => setTimeout(() => rej(new Error("relay timeout")), ms)),
+  ]);
+}
+
 export async function isPaused(contractId: string): Promise<boolean> {
   return (await viewStr(contractId, "is_paused", {})) === "1";
 }

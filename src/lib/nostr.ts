@@ -138,7 +138,8 @@ export async function fetchReactions(eventIds: string[]): Promise<Map<string, { 
 // ── Publish ──
 export async function publishEvent(signedEvent: Event): Promise<void> {
   const results = await Promise.allSettled(
-    [...WRITE_RELAYS, ...NIP46_RELAYS].map((r) => pool.publish([r], signedEvent)),
+    // pool.publish returns Promise<string>[] (one promise per relay) — [0]
+    [...WRITE_RELAYS, ...NIP46_RELAYS].map((r) => pool.publish([r], signedEvent)[0]),
   );
   const ok = results.filter((r) => r.status === "fulfilled").length;
   console.log(`[nostr] published to ${ok}/${results.length} relays`);
