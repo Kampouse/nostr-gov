@@ -172,7 +172,7 @@ function tagGet(tags: string, key: string): string {
   if (strLength(rest) === 0) {
     return EMPTY;
   }
-  return strSlice(rest, 0, strIndexOf(rest, "\""));
+  return strSlice(rest, 0, strIndexOf(rest, unquote()));
 }
 
 function tagAction(tags: string) {
@@ -186,6 +186,32 @@ function tagNonce(tags: string) {
 }
 function tagExpires(tags: string) {
   return tagGet(tags, "expires");
+}
+
+// Sentinel protocol (2026-09-03): the host jsonGetStr copies raw bytes up
+// to the first quote, so arg values containing escaped quotes (tags JSON,
+// envelope content) arrive truncated/corrupted. Senders therefore replace
+// every double-quote in tags/ct with "~" (never present in event bytes)
+// and unsentinel() restores them byte-exact before verification.
+function unquote(): string {
+  // jsonQuote wraps in literal quotes; slice one off as the quote char
+  return strSlice(jsonQuote(EMPTY), 0, 1);
+}
+
+function unsentinel(s: string): string {
+  let out = "";
+  const n = strLength(s);
+  let i = 0;
+  while (i < n) {
+    const c = strSlice(s, i, i + 1);
+    if (c === "~") {
+      out = out + unquote();
+    } else {
+      out = out + c;
+    }
+    i = i + 1;
+  }
+  return out;
 }
 
 function eventSerialize(pk: string, cat: string, kind: string, tags: string, content: string) {
@@ -224,8 +250,8 @@ function walThr(name: string): string {
 function verifyOwnerEvent(actionStr: string) {
   const pk = near.jsonGetStr("pk") ?? "";
   const kind = near.jsonGetStr("kind") ?? "";
-  const tags = near.jsonGetStr("tags") ?? "";
-  const content = near.jsonGetStr("ct") ?? "";
+  const tags = unsentinel(near.jsonGetStr("tags") ?? "");
+  const content = unsentinel(near.jsonGetStr("ct") ?? "");
   const sig = near.jsonGetStr("sig") ?? "";
   const cat = near.jsonGetStr("cat") ?? "";
   if (strLength(pk) !== 64) {
@@ -270,8 +296,8 @@ function verifyOwnerEvent(actionStr: string) {
 function verifyGuardianEvent(actionStr: string) {
   const pk = near.jsonGetStr("pk") ?? "";
   const kind = near.jsonGetStr("kind") ?? "";
-  const tags = near.jsonGetStr("tags") ?? "";
-  const content = near.jsonGetStr("ct") ?? "";
+  const tags = unsentinel(near.jsonGetStr("tags") ?? "");
+  const content = unsentinel(near.jsonGetStr("ct") ?? "");
   const sig = near.jsonGetStr("sig") ?? "";
   const cat = near.jsonGetStr("cat") ?? "";
   if (strLength(pk) !== 64) {
@@ -586,8 +612,8 @@ export function approve_with_event() {
   const pk = near.jsonGetStr("pk") ?? "";
   const sig = near.jsonGetStr("sig") ?? "";
   const kind = near.jsonGetStr("kind") ?? "";
-  const tags = near.jsonGetStr("tags") ?? "";
-  const ct = near.jsonGetStr("ct") ?? "";
+  const tags = unsentinel(near.jsonGetStr("tags") ?? "");
+  const ct = unsentinel(near.jsonGetStr("ct") ?? "");
   if (kind !== "37500") {
     die("ERR_EVENT_KIND");
   }

@@ -608,7 +608,7 @@ export class RelayWatcher {
       publicKey: pubRaw,
       nonce: BigInt(nonce) + 1n,
       receiverId: parsed.contractId,
-      actions: [{ type: "FunctionCall" as const, methodName: parsed.method, args: argsB64, gas: 30000000000000n, deposit: 0n }],
+      actions: [{ type: "FunctionCall" as const, methodName: parsed.method, args: argsB64, gas: 90000000000000n, deposit: 0n }],
       blockHash: base58ToBytes(blockHash),
     });
 
