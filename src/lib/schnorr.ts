@@ -149,12 +149,17 @@ export const buildGovEnvelope = async (params: {
     nonce,
     expiresAt: params.expiresAt,
     contractId: params.contractId,
-    content: "gov:" + JSON.stringify({
+    // Sentinel protocol: quotes in the signed content travel as `~`. The
+    // contract rebuilds NIP-01 canonical bytes by naive concat — with bare
+    // quotes that can never match JSON.stringify's escaped form (SIG_INVALID
+    // on every quoted envelope). Quote-free content makes the concat exact.
+    // The contract unsentinels (`~` → `"`) when parsing the business payload.
+    content: ("gov:" + JSON.stringify({
       v: 1,
       method: params.method,
       contractId: params.contractId,
       args: payload,
-    }),
+    })).replaceAll('"', "~"),
   });
   const { finalizeEvent } = await import("nostr-tools");
   const signed = params.signCtx.secretKey

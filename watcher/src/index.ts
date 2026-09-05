@@ -383,7 +383,11 @@ export class RelayWatcher {
     if (event.content.startsWith("gov:")) {
       let env: GovEnvelope;
       try {
-        env = JSON.parse(event.content.slice(4)) as GovEnvelope;
+        // Sentinel protocol: the signer replaces `"` with `~` in the signed
+        // content so the contract's naive NIP-01 concat stays canonical.
+        // Unsentinel here only to READ the envelope (whitelist + args);
+        // the submitted tx still carries the original signed bytes.
+        env = JSON.parse(event.content.slice(4).replaceAll("~", '"')) as GovEnvelope;
       } catch {
         return null;
       }
