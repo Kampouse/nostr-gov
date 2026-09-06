@@ -166,7 +166,7 @@ async function callMethodVerified(
   if (hash) await verifyTxSuccess(hash, accountId);
 }
 
-async function publishToRelayerRelays(event: Event): Promise<{ relays: number; via: "relays" | "ingest" }> {
+async function publishToRelayerRelays(event: Event): Promise<{ relays: number; via: "relays" | "relays+ingest" | "ingest" }> {
   // Per-relay timeout: a socket that neither opens nor errors (hang) would
   // stall allSettled forever and the ingest fallback would never fire —
   // exact live failure: sign OK, "GET wss://nos.lol/", then silence.
@@ -174,8 +174,20 @@ async function publishToRelayerRelays(event: Event): Promise<{ relays: number; v
   // [0] to get the actual promise; feeding the array to allSettled made it
   // resolve instantly as "fulfilled" and the ingest fallback never fired.
   const publishes: Array<Promise<unknown>> = RELAYER_RELAYS.map((r) => withTimeout(pool.publish([r], event)[0], 6000));
+  // ALWAYS direct-ingest to the watcher in parallel. Kind-37500 retention on
+  // public relays is unreliable at the minute scale (events purged before
+  // the watcher's next poll = silent loss). The watcher dedupes by id, so
+  // relay + ingest delivery is safe.
+  const ingested = fetch(RELAYER_WATCHER_URL + "/ingest", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event }),
+  }).then((res) => (res.ok ? res.json() : Promise.reject(new Error(`ingest ${res.status}`))))
+    .then((d: { ok?: boolean; error?: string }) => (d.ok ? true : Promise.reject(new Error(d.error || "ingest rejected"))))
+    .catch(() => false);
   const results = await Promise.allSettled(publishes);
   const ok = results.filter((r) => r.status === "fulfilled").length;
+  if (await ingested) return { relays: ok, via: "relays+ingest" };
   if (ok > 0) return { relays: ok, via: "relays" };
   // Relay fallback: direct POST to the watcher's ingest endpoint. The
   // event is already signed and NIP-01-id-stamped; the watcher re-verifies
@@ -199,7 +211,7 @@ async function proposeViaRelayer(
   contractId: string, walletName: string,
   p: { method: "propose" | "execute"; proposalId?: string; args: Record<string, unknown> },
   signCtx: SignCtx,
-): Promise<{ relays: number; via: "relays" | "ingest"; eventId: string }> {
+): Promise<{ relays: number; via: "relays" | "relays+ingest" | "ingest"; eventId: string }> {
   const { buildGovEnvelope } = await import("../lib/schnorr");
   const { event } = await buildGovEnvelope({
     method: p.method,
@@ -665,7 +677,7 @@ function WalletLevel({
       if (useRelayer) {
         const { relays, via, eventId } = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
         setWatch({ eventId, label: `Payout proposal #${proposalId}` });
-        toast("ok", `Payout proposal #${proposalId} ${via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — watcher will confirm below`);
+        toast("ok", `Payout proposal #${proposalId} ${via.includes("ingest") ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — watcher will confirm below`);
       } else {
         await callMethodVerified(wallet, accountId!, contractId, "propose", args);
         toast("ok", `Payout proposal #${proposalId} created`);
@@ -691,7 +703,7 @@ function WalletLevel({
       if (useRelayer) {
         const { relays, via, eventId } = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
         setWatch({ eventId, label: `Rotation #${proposalId}` });
-        toast("ok", `Rotation #${proposalId} ${via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — watcher will confirm below`);
+        toast("ok", `Rotation #${proposalId} ${via.includes("ingest") ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — watcher will confirm below`);
       } else {
         await callMethodVerified(wallet, accountId!, contractId, "propose", args);
         toast("ok", "Approver rotation proposed");
@@ -988,7 +1000,7 @@ function ProposalLevel({
         args: { name: walletName, id: p.id },
       }, signCtx);
       setWatch({ eventId: ok.eventId, label: `Execute proposal #${p.id}` });
-      toast("ok", `Execute #${p.id} ${ok.via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${ok.relays}/${RELAYER_RELAYS.length} relays`} — watcher will confirm below`);
+      toast("ok", `Execute #${p.id} ${ok.via.includes("ingest") ? "sent direct to watcher (relays unreachable)" : `published to ${ok.relays}/${RELAYER_RELAYS.length} relays`} — watcher will confirm below`);
       setTimeout(refresh, 10_000);
     } catch (e: any) {
       toast("err", e.message?.slice(0, 180) || "relay execute failed");

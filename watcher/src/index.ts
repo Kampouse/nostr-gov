@@ -121,6 +121,7 @@ export class RelayWatcher {
   private relayStatus: RelayStatus[] = [];
   private alarmTimer: ReturnType<typeof setInterval> | null = null;
   private processedEvents: Set<string> = new Set();
+  private hydratedDedup = false;
   private reconnectTimers: Map<string, number> = new Map();
   private lastError: string | null = null;
   private eventLog: EventRecord[] = [];
@@ -186,6 +187,8 @@ export class RelayWatcher {
     if (request.method === "GET" && url.pathname === "/events") {
       const cors = { "Access-Control-Allow-Origin": "*" };
       await this.hydrateLog();
+      const lastPoll = Math.max(0, ...this.relayStatus.map((r) => r.lastPoll ?? 0));
+      if (Date.now() - lastPoll > 15_000) void this.pollAll().catch(() => {});
       const eventId = url.searchParams.get("eventId");
       const limit = Math.min(Number(url.searchParams.get("limit") ?? 25), 100);
       let records = this.eventLog;
@@ -197,8 +200,8 @@ export class RelayWatcher {
     }
 
     if (request.method === "POST" && url.pathname === "/connect") {
-      this.connectAll();
-      return Response.json({ ok: true, relays: this.relayUrls });
+      await this.pollAll();
+      return Response.json({ ok: true, relays: this.relayUrls, polled: this.relayStatus });
     }
 
     if (request.method === "POST" && url.pathname === "/disconnect") {
@@ -254,12 +257,12 @@ export class RelayWatcher {
   // stale, every cycle is provably fresh.
 
   private async pollAll(): Promise<void> {
-    for (const url of this.relayUrls) {
+    await Promise.all(this.relayUrls.map(async (url) => {
       try { await this.pollRelay(url); } catch (e) {
         console.log(`[watcher] poll failed on ${url}: ${String(e).slice(0, 120)}`);
         this.setRelayStatus(url, { lastOk: false });
       }
-    }
+    }));
   }
 
   private setRelayStatus(url: string, patch: Partial<RelayStatus>) {
@@ -311,7 +314,20 @@ export class RelayWatcher {
 
   private async handleGovernanceEvent(event: NostrEvent, relayUrl: string) {
     if (this.processedEvents.has(event.id)) return;
+    // Hydrate the persisted dedupe set once per instance — without this an
+    // eviction mid-poll reprocesses the same events (duplicate records,
+    // double on-chain submits).
+    if (!this.hydratedDedup) {
+      const storedIds = await this.state.storage.get<string[]>("processedIds");
+      if (storedIds) for (const id of storedIds) this.processedEvents.add(id);
+      this.hydratedDedup = true;
+    }
+    if (this.processedEvents.has(event.id)) return;
     this.processedEvents.add(event.id);
+    // Write-ahead BEFORE any submit: if the instance dies mid-submit, the
+    // record may stay "pending" but the event will never be double-submitted.
+    const ids = Array.from(this.processedEvents).slice(-MAX_EVENTS);
+    await this.state.storage.put("processedIds", ids);
 
     if (this.processedEvents.size > 10000) {
       const arr = Array.from(this.processedEvents);
@@ -622,7 +638,9 @@ export class RelayWatcher {
   // ── Event log management ────────────────────────────────────────────
 
   private pushEventLog(record: EventRecord) {
-    this.eventLog.push(record);
+    const idx = this.eventLog.findIndex((e) => e.eventId === record.eventId);
+    if (idx >= 0) this.eventLog[idx] = { ...this.eventLog[idx], ...record };
+    else this.eventLog.push(record);
     if (this.eventLog.length > MAX_EVENTS) {
       this.eventLog = this.eventLog.slice(-Math.floor(MAX_EVENTS / 2));
     }
