@@ -12,7 +12,7 @@
  * get_wallet_count, get_wallet_name, get_proposal_ids.
  */
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Landmark, Wallet as WalletIcon, ChevronRight, ChevronLeft, Plus, Clock,
@@ -199,7 +199,7 @@ async function proposeViaRelayer(
   contractId: string, walletName: string,
   p: { method: "propose" | "execute"; proposalId?: string; args: Record<string, unknown> },
   signCtx: SignCtx,
-): Promise<{ relays: number; via: "relays" | "ingest" }> {
+): Promise<{ relays: number; via: "relays" | "ingest"; eventId: string }> {
   const { buildGovEnvelope } = await import("../lib/schnorr");
   const { event } = await buildGovEnvelope({
     method: p.method,
@@ -210,7 +210,87 @@ async function proposeViaRelayer(
     args: p.args,
     signCtx,
   });
-  return publishToRelayerRelays(event as Event);
+  const { relays, via } = await publishToRelayerRelays(event as Event);
+  return { relays, via, eventId: (event as Event).id };
+}
+
+// ── watcher feedback loop ────────────────────────────────────────────────
+// The relayer is fire-and-forget at the relay layer: publishing "succeeds"
+// even if the watcher never picks the event up, or the on-chain call
+// panics. This polls the watcher's /events endpoint for the real outcome.
+
+type WatchOutcome =
+  | { phase: "waiting"; detail: string }
+  | { phase: "ok"; detail: string; txHash: string | null }
+  | { phase: "err"; detail: string }
+  | { phase: "dropped"; detail: string }
+  | { phase: "timeout" };
+
+function useWatcherOutcome(eventId: string | null) {
+  const [st, setSt] = useState<WatchOutcome>({ phase: "waiting", detail: "watcher hasn't reported yet" });
+  useEffect(() => {
+    if (!eventId) return;
+    let alive = true;
+    const started = Date.now();
+    setSt({ phase: "waiting", detail: "watcher hasn't reported yet" });
+    const tick = async () => {
+      if (!alive) return;
+      try {
+        const r = await fetch(`${RELAYER_WATCHER_URL}/events?eventId=${eventId}`);
+        const j = await r.json() as { events?: { status: string; error: string | null; txHash: string | null }[] };
+        const rec = j.events?.[0];
+        if (rec && alive) {
+          if (rec.status === "success") {
+            setSt({ phase: "ok", detail: "confirmed on-chain", txHash: rec.txHash });
+          } else if (rec.status === "failed") {
+            setSt({ phase: "err", detail: rec.error ?? "on-chain call failed" });
+          } else if (rec.status === "dropped") {
+            setSt({ phase: "dropped", detail: rec.error ?? "watcher dropped this event" });
+          } else if (rec.status === "pending" || rec.status === "submitted") {
+            setSt({ phase: "waiting", detail: "watcher received it — submitting to NEAR…" });
+          }
+        }
+      } catch { /* transient fetch failure — keep polling */ }
+      if (alive && Date.now() - started > 90_000 && document.hasFocus()) {
+        setSt({ phase: "timeout" });
+      }
+    };
+    const iv = setInterval(tick, 2500);
+    tick();
+    return () => { alive = false; clearInterval(iv); };
+  }, [eventId]);
+  return st;
+}
+
+function WatcherStatusCard({ eventId, label, onClose }: { eventId: string; label: string; onClose: () => void }) {
+  const st = useWatcherOutcome(eventId);
+  const icon = st.phase === "ok" ? <Check size={13} className="mt-0.5 shrink-0" />
+    : st.phase === "err" || st.phase === "dropped" || st.phase === "timeout" ? <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+    : <Loader2 size={13} className="mt-0.5 shrink-0 animate-spin" />;
+  const tone = st.phase === "ok" ? "bg-neon-dim border-neon/30 text-neon"
+    : st.phase === "waiting" ? "bg-surface2 border-line text-text2"
+    : "bg-red/10 border-red/30 text-red";
+  const detail = st.phase === "timeout"
+    ? "no watcher response after 90s — is this treasury watched? (watcher /health)"
+    : st.detail;
+  const txLink = st.phase === "ok" && st.txHash
+    ? <a className="underline underline-offset-2" target="_blank" rel="noreferrer"
+        href={`https://testnet.nearblocks.io/tx/${st.txHash}`}>view tx ↗</a>
+    : null;
+  const terminal = st.phase !== "waiting";
+  return (
+    <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex items-start gap-2 px-3 py-2 rounded-[10px] border text-[11px] max-w-md w-[92%] ${tone}`}>
+      {icon}
+      <span className="break-all leading-relaxed">
+        <span className="text-text1 font-medium">{label}</span> — {detail} {txLink}
+      </span>
+      {terminal && (
+        <button onClick={onClose} className="ml-auto text-text4 hover:text-text1 shrink-0" aria-label="dismiss">
+          <X size={12} className="mt-0.5" />
+        </button>
+      )}
+    </div>
+  );
 }
 
 // ── shared sign context type ─────────────────────────────────────────────
@@ -523,7 +603,7 @@ function TreasuryLevel({
 // ═════════════════════════════════════════════════════════════════════════
 
 function WalletLevel({
-  contractId, walletName, userNpub, onBack, onSelectProposal, canSign, signCtx, useRelayer, toast,
+  contractId, walletName, userNpub, onBack, onSelectProposal, canSign, signCtx, useRelayer, toast, setWatch,
 }: {
   contractId: string;
   walletName: string;
@@ -534,6 +614,7 @@ function WalletLevel({
   signCtx: SignCtx;
   useRelayer: boolean;
   toast: (kind: "ok" | "err", text: string) => void;
+  setWatch: (w: { eventId: string; label: string } | null) => void;
 }) {
   const { accountId, wallet } = useNear();
   const queryClient = useQueryClient();
@@ -582,8 +663,9 @@ function WalletLevel({
         amount: amt, recipient: payTo.trim(), token: payToken.trim(),
       }, signCtx);
       if (useRelayer) {
-        const { relays, via } = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
-        toast("ok", `Payout proposal #${proposalId} ${via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — proposing on-chain`);
+        const { relays, via, eventId } = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
+        setWatch({ eventId, label: `Payout proposal #${proposalId}` });
+        toast("ok", `Payout proposal #${proposalId} ${via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — watcher will confirm below`);
       } else {
         await callMethodVerified(wallet, accountId!, contractId, "propose", args);
         toast("ok", `Payout proposal #${proposalId} created`);
@@ -607,8 +689,9 @@ function WalletLevel({
         walletName, expiresAt, action: "appr", newApprovers: nps.join(","), newThreshold: apprThr || "1",
       }, signCtx);
       if (useRelayer) {
-        const { relays, via } = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
-        toast("ok", `Rotation #${proposalId} ${via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — proposing on-chain`);
+        const { relays, via, eventId } = await proposeViaRelayer(contractId, walletName, { method: "propose", args }, signCtx);
+        setWatch({ eventId, label: `Rotation #${proposalId}` });
+        toast("ok", `Rotation #${proposalId} ${via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${relays}/${RELAYER_RELAYS.length} relays`} — watcher will confirm below`);
       } else {
         await callMethodVerified(wallet, accountId!, contractId, "propose", args);
         toast("ok", "Approver rotation proposed");
@@ -774,7 +857,7 @@ function WalletLevel({
 // ═════════════════════════════════════════════════════════════════════════
 
 function ProposalLevel({
-  contractId, walletName, proposalId, userNpub, onBack, canSign, signCtx, useRelayer, toast,
+  contractId, walletName, proposalId, userNpub, onBack, canSign, signCtx, useRelayer, toast, setWatch,
 }: {
   contractId: string;
   walletName: string;
@@ -785,6 +868,7 @@ function ProposalLevel({
   signCtx: SignCtx;
   useRelayer: boolean;
   toast: (kind: "ok" | "err", text: string) => void;
+  setWatch: (w: { eventId: string; label: string } | null) => void;
 }) {
   const { accountId, wallet } = useNear();
   const queryClient = useQueryClient();
@@ -903,7 +987,8 @@ function ProposalLevel({
         proposalId: p.id,
         args: { name: walletName, id: p.id },
       }, signCtx);
-      toast("ok", `Execute #${p.id} ${ok.via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${ok.relays}/${RELAYER_RELAYS.length} relays`} — executing on-chain`);
+      setWatch({ eventId: ok.eventId, label: `Execute proposal #${p.id}` });
+      toast("ok", `Execute #${p.id} ${ok.via === "ingest" ? "sent direct to watcher (relays unreachable)" : `published to ${ok.relays}/${RELAYER_RELAYS.length} relays`} — watcher will confirm below`);
       setTimeout(refresh, 10_000);
     } catch (e: any) {
       toast("err", e.message?.slice(0, 180) || "relay execute failed");
@@ -1043,6 +1128,7 @@ export default function GovernancePage() {
   const { accountId, wallet } = useNear();
   const queryClient = useQueryClient();
   const { toasts, push } = useToasts();
+  const [watch, setWatch] = useState<{ eventId: string; label: string } | null>(null);
 
   // drill-down: treasury → wallet → proposal
   const [sel, setSel] = useState<{ t: string | null; w: string | null; p: string | null }>({ t: null, w: null, p: null });
@@ -1105,6 +1191,7 @@ export default function GovernancePage() {
           signCtx={signCtx}
           useRelayer={useRelayer}
           toast={push}
+          setWatch={setWatch}
           onBack={() => setSel({ t: sel.t, w: null, p: null })}
           onSelectProposal={(id) => setSel({ t: sel.t, w: sel.w, p: id })}
         />
@@ -1119,6 +1206,7 @@ export default function GovernancePage() {
           signCtx={signCtx}
           useRelayer={useRelayer}
           toast={push}
+          setWatch={setWatch}
           onBack={() => setSel({ t: sel.t, w: sel.w, p: null })}
         />
       )}
@@ -1144,6 +1232,7 @@ export default function GovernancePage() {
       )}
 
       <Toasts toasts={toasts} />
+      {watch && <WatcherStatusCard eventId={watch.eventId} label={watch.label} onClose={() => setWatch(null)} />}
     </div>
   );
 }

@@ -30,7 +30,7 @@ interface NostrEvent {
   sig: string;
 }
 
-type EventStatus = "pending" | "submitted" | "success" | "failed";
+type EventStatus = "pending" | "submitted" | "success" | "failed" | "dropped";
 
 interface EventRecord {
   eventId: string;
@@ -38,6 +38,7 @@ interface EventRecord {
   method: string;
   walletName: string;
   proposalId: number;
+  contractId: string | null;
   txHash: string | null;
   error: string | null;
   retries: number;
@@ -68,11 +69,16 @@ class TxResult {
   contractSuccess: boolean | null;
 
   get recordUpdate() {
-    return {
-      txHash: this.txHash,
-      error: this.error,
-      status: (this.ok ? "success" : "failed") as EventStatus,
+    // Don't clobber a previously-recorded txHash with null on a failed
+    // retry — the first attempt's hash is the one worth inspecting.
+    const upd: Partial<EventRecord> & { status: EventStatus } = {
+      // The chain reached a final state AND the contract call itself did not
+      // panic — a FINAL status with a contract panic is still a failure.
+      status: (this.ok && this.contractSuccess !== false ? "success" : "failed"),
     };
+    if (this.txHash) upd.txHash = this.txHash;
+    if (this.error) upd.error = this.error;
+    return upd;
   }
 
   constructor(ok: boolean, txHash: string | null, error: string | null, contractSuccess: boolean | null) {
@@ -169,6 +175,21 @@ export class RelayWatcher {
           retries: e.retries,
         })),
       });
+    }
+
+    // Full event records for the FE feedback loop. The FE polls this after
+    // publishing a governance event to show the real pipeline state
+    // (published → watcher saw → on-chain ✅/❌) instead of fire-and-pray.
+    if (request.method === "GET" && url.pathname === "/events") {
+      const cors = { "Access-Control-Allow-Origin": "*" };
+      const eventId = url.searchParams.get("eventId");
+      const limit = Math.min(Number(url.searchParams.get("limit") ?? 25), 100);
+      let records = this.eventLog;
+      if (eventId) records = records.filter((e) => e.eventId === eventId || e.eventId.startsWith(eventId));
+      return Response.json(
+        { events: records.slice(-limit).reverse(), watcher: { account: this.env.NEAR_ACCOUNT_ID, treasury: CONTRACT_IDS(this.env) } },
+        { headers: cors },
+      );
     }
 
     if (request.method === "POST" && url.pathname === "/connect") {
@@ -324,7 +345,24 @@ export class RelayWatcher {
     // Parse the event to determine contract method
     const parsed = this.parseGovernanceEvent(event);
     if (!parsed) {
-      console.log(`[watcher] event does not target our contract or missing required tags, skipping`);
+      const contractTag = event.tags.find((t) => t[0] === "contract")?.[1] ?? null;
+      // Drops are recorded too — without this, an event the watcher ignores
+      // is indistinguishable from one it never saw (the "nothing happens"
+      // failure mode). The FE surfaces these reasons directly.
+      this.pushEventLog({
+        eventId: event.id,
+        status: "dropped",
+        method: "dropped",
+        walletName: "",
+        proposalId: 0,
+        contractId: contractTag,
+        txHash: null,
+        error: this.dropReason(event, contractTag),
+        retries: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      console.log(`[watcher] event dropped: ${this.dropReason(event, contractTag)}`);
       return;
     }
 
@@ -334,6 +372,7 @@ export class RelayWatcher {
       method: parsed.method,
       walletName: parsed.walletName,
       proposalId: parsed.proposalId,
+      contractId: parsed.contractId,
       txHash: null,
       error: null,
       retries: 0,
@@ -353,6 +392,28 @@ export class RelayWatcher {
 
     // Publish result back to all connected relays
     this.publishResult(event, result, relayUrl, parsed.contractId);
+  }
+
+  // Human-readable reason an event was dropped — powers the FE feedback.
+  private dropReason(event: NostrEvent, contractTag: string | null): string {
+    if (!contractTag) return "no #contract tag on event";
+    if (!CONTRACT_IDS(this.env).includes(contractTag)) {
+      return `treasury ${contractTag} is NOT watched — add it to TREASURY_CONTRACT_IDS`;
+    }
+    if (event.content.startsWith("gov:")) {
+      try {
+        const env = JSON.parse(event.content.slice(4).replaceAll("~", '"')) as GovEnvelope;
+        if (env?.v !== 1 || (env.method !== "propose" && env.method !== "execute")) {
+          return `method not relayed (got v=${env?.v} method=${env?.method})`;
+        }
+        if (env.contractId !== contractTag) return "envelope contractId ≠ #contract tag";
+      } catch {
+        return "gov envelope content is not valid JSON (even after unsentinel)";
+      }
+    } else if (!event.tags.find((t) => t[0] === "wallet")?.[1]) {
+      return "approval event missing #wallet tag";
+    }
+    return "unparsed shape";
   }
 
   // ── Parse governance event ────────────────────────────────────────
