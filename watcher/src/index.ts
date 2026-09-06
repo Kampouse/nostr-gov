@@ -57,9 +57,11 @@ interface GovEnvelope {
   args: Record<string, unknown>;
 }
 
-interface RelayConn {
-  ws: WebSocket;
+interface RelayStatus {
   url: string;
+  lastPoll: number | null;   // ms of last successful poll
+  lastOk: boolean;           // did the last poll complete (not timeout/error)
+  lastEvents: number;        // events received in last poll
 }
 
 class TxResult {
@@ -116,7 +118,8 @@ const CONTRACT_IDS = (env: Env): string[] => {
 export class RelayWatcher {
   private state: DurableObjectState;
   private env: Env;
-  private conns: RelayConn[] = [];
+  private relayStatus: RelayStatus[] = [];
+  private alarmTimer: ReturnType<typeof setInterval> | null = null;
   private processedEvents: Set<string> = new Set();
   private reconnectTimers: Map<string, number> = new Map();
   private lastError: string | null = null;
@@ -158,8 +161,8 @@ export class RelayWatcher {
 
     if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({
-        connected: this.conns.filter((c) => c.ws.readyState === WebSocket.OPEN).length,
-        relays: this.conns.map((c) => ({ url: c.url, open: c.ws.readyState === WebSocket.OPEN })),
+        pollModel: true,
+        relays: this.relayStatus.map((r) => ({ url: r.url, ok: r.lastOk, lastPollAgoSec: r.lastPoll ? Math.round((Date.now() - r.lastPoll) / 1000) : null, events: r.lastEvents })),
         treasury: CONTRACT_IDS(this.env),
         account: this.env.NEAR_ACCOUNT_ID,
         processed: this.processedEvents.size,
@@ -182,6 +185,7 @@ export class RelayWatcher {
     // (published → watcher saw → on-chain ✅/❌) instead of fire-and-pray.
     if (request.method === "GET" && url.pathname === "/events") {
       const cors = { "Access-Control-Allow-Origin": "*" };
+      await this.hydrateLog();
       const eventId = url.searchParams.get("eventId");
       const limit = Math.min(Number(url.searchParams.get("limit") ?? 25), 100);
       let records = this.eventLog;
@@ -241,95 +245,69 @@ export class RelayWatcher {
     return new Response("Not found", { status: 404 });
   }
 
-  // ── Relay connections ──────────────────────────────────────────────
+  // ── Relay polling ─────────────────────────────────────────────────
+  // Long-lived outbound WebSockets inside a DO turn into silent zombies:
+  // after eviction the readyState still says OPEN while the socket is dead
+  // server-side — health shows "connected" while events vanish. Instead we
+  // POLL: the 20s alarm opens a fresh socket per relay, REQs everything
+  // since the last watermark, drains to EOSE, then closes. No state to go
+  // stale, every cycle is provably fresh.
 
-  private connectAll() {
-    for (const url of this.relayUrls) this.connectRelay(url);
-  }
-
-  private disconnectAll() {
-    for (const url of this.relayUrls) this.disconnectRelay(url);
-  }
-
-  private connectRelay(url: string) {
-    const existing = this.conns.find((c) => c.url === url);
-    if (existing?.ws.readyState === WebSocket.OPEN) return;
-
-    console.log(`[watcher] connecting to ${url}`);
-    const ws = new WebSocket(url);
-    const conn: RelayConn = { ws, url };
-    this.conns.push(conn);
-
-    ws.addEventListener("open", () => {
-      console.log(`[watcher] connected to ${url}, subscribing`);
-      // Subscribe to nostr-gov events. IMPORTANT: filter on the #t tag,
-      // NOT #contract — NIP-01 only requires relays to index single-letter
-      // tags; multi-letter filters like #contract are unindexed (primal
-      // silently returns nothing, nos.lol rejects the REQ outright).
-      // parseGovernanceEvent content-filters by the #contract tag anyway.
-      ws.send(JSON.stringify([
-        "REQ",
-        "gov-watch",
-        { kinds: [GOVERNANCE_KIND], "#t": ["nostr-gov"], limit: 100 },
-      ]));
-    });
-
-    ws.addEventListener("message", (event: MessageEvent) => {
-      this.handleRelayMessage(event.data as string, url);
-    });
-
-    ws.addEventListener("close", () => {
-      console.log(`[watcher] disconnected from ${url}`);
-      this.conns = this.conns.filter((c) => c.ws !== ws);
-      this.scheduleReconnect(url);
-    });
-
-    ws.addEventListener("error", () => {
-      console.log(`[watcher] relay error on ${url}`);
-    });
-  }
-
-  private disconnectRelay(url: string) {
-    const timer = this.reconnectTimers.get(url);
-    if (timer !== undefined) { clearTimeout(timer); this.reconnectTimers.delete(url); }
-    const conn = this.conns.find((c) => c.url === url);
-    if (conn) {
-      conn.ws.close(1000, "shutdown");
-      this.conns = this.conns.filter((c) => c.ws !== conn.ws);
+  private async pollAll(): Promise<void> {
+    for (const url of this.relayUrls) {
+      try { await this.pollRelay(url); } catch (e) {
+        console.log(`[watcher] poll failed on ${url}: ${String(e).slice(0, 120)}`);
+        this.setRelayStatus(url, { lastOk: false });
+      }
     }
   }
 
-  private scheduleReconnect(url: string) {
-    if (this.reconnectTimers.has(url)) return;
-    const timer = setTimeout(() => {
-      this.reconnectTimers.delete(url);
-      this.connectRelay(url);
-    }, 5000) as unknown as number;
-    this.reconnectTimers.set(url, timer);
+  private setRelayStatus(url: string, patch: Partial<RelayStatus>) {
+    const i = this.relayStatus.findIndex((r) => r.url === url);
+    if (i < 0) this.relayStatus.push({ url, lastPoll: null, lastOk: false, lastEvents: 0, ...patch });
+    else this.relayStatus[i] = { ...this.relayStatus[i], ...patch };
   }
 
-  // ── Relay message handling ──────────────────────────────────────────
+  private async pollRelay(url: string): Promise<void> {
+    const sinceKey = "since:" + url;
+    const since = (await this.state.storage.get<number>(sinceKey)) ?? Math.floor(Date.now() / 1000) - 600;
 
-  private handleRelayMessage(raw: string, relayUrl: string) {
-    let msg: unknown;
-    try { msg = JSON.parse(raw); } catch { return; }
-    if (!Array.isArray(msg)) return;
+    const events: NostrEvent[] = await new Promise<NostrEvent[]>((resolve, reject) => {
+      const ws = new WebSocket(url);
+      const got: NostrEvent[] = [];
+      const finish = () => { try { ws.close(); } catch { /* already closed */ } resolve(got); };
+      const timer = setTimeout(() => { this.lastError = `poll timeout on ${url}`; finish(); }, 8000);
+      ws.addEventListener("open", () => {
+        // Filter on the #t tag, NOT #contract — NIP-01 relays only index
+        // single-letter tags; multi-letter filters are unindexed (primal
+        // returns nothing, nos.lol rejects the REQ outright).
+        ws.send(JSON.stringify(["REQ", "gov-watch",
+          { kinds: [GOVERNANCE_KIND], "#t": ["nostr-gov"], since: since - 60, limit: 200 }]));
+      });
+      ws.addEventListener("message", (m: MessageEvent) => {
+        let msg: unknown;
+        try { msg = JSON.parse(m.data as string); } catch { return; }
+        if (!Array.isArray(msg)) return;
+        if (msg[0] === "EVENT") got.push(msg[2] as NostrEvent);
+        else if (msg[0] === "EOSE") { clearTimeout(timer); finish(); }
+        else if (msg[0] === "CLOSED") { this.lastError = `REQ closed by ${url}: ${String(msg[2] ?? "").slice(0, 100)}`; }
+      });
+      ws.addEventListener("error", () => { clearTimeout(timer); reject(new Error("ws error")); });
+      ws.addEventListener("close", () => { clearTimeout(timer); resolve(got); });
+    });
 
-    const [type] = msg as [string, ...unknown[]];
-
-    if (type === "EVENT") {
-      const [, , event] = msg as [string, string, NostrEvent];
-      this.handleGovernanceEvent(event, relayUrl);
-    } else if (type === "EOSE") {
-      console.log(`[watcher] caught up on ${relayUrl}`);
-    } else if (type === "CLOSED") {
-      // A relay rejecting our subscription is fatal for that path —
-      // surface it; without this the failure is completely silent.
-      const reason = String(msg[2] ?? "").slice(0, 120);
-      console.log(`[watcher] subscription CLOSED by ${relayUrl}: ${reason}`);
-      this.lastError = `sub closed by ${relayUrl}: ${reason}`;
+    let maxTs = since;
+    for (const ev of events) {
+      if (ev.created_at > maxTs) maxTs = ev.created_at;
+      await this.handleGovernanceEvent(ev, url);
     }
+    await this.state.storage.put(sinceKey, maxTs);
+    this.setRelayStatus(url, { lastPoll: Date.now(), lastOk: true, lastEvents: events.length });
   }
+
+  // Legacy compat for /connect — now an immediate poll.
+  private connectAll() { void this.pollAll(); }
+  private disconnectAll() { /* nothing to disconnect in the polling model */ }
 
   private async handleGovernanceEvent(event: NostrEvent, relayUrl: string) {
     if (this.processedEvents.has(event.id)) return;
@@ -380,6 +358,18 @@ export class RelayWatcher {
       updatedAt: Date.now(),
     };
     this.pushEventLog(record);
+
+    // Gas guard: an envelope whose expires tag is already in the past can
+    // only panic ERR_SIG_EXPIRED on-chain (the replay/backlog path used to
+    // burn gas on these). Record the drop, skip the tx.
+    const teStr = event.tags.find((t) => t[0] === "expires")?.[1];
+    const teNs = teStr ? Number(teStr) : NaN;
+    if (Number.isFinite(teNs) && teNs < Date.now() * 1e6) {
+      const i0 = this.eventLog.findIndex((e) => e.eventId === event.id);
+      if (i0 >= 0) { this.eventLog[i0] = { ...this.eventLog[i0], status: "dropped", error: "envelope expired before submit (skipped gas)", updatedAt: Date.now() }; this.persistLog(); }
+      console.log(`[watcher] event ${event.id.slice(0, 12)} expired, skipping submit`);
+      return;
+    }
 
     const result = await this.submitWithRetry(parsed, event);
     const idx = this.eventLog.findIndex((e) => e.eventId === event.id);
@@ -615,13 +605,17 @@ export class RelayWatcher {
       pubkey: "watcher",
     };
 
+    // Unsigned status events are rejected by spec-compliant relays; this is
+    // best-effort only — the authoritative feedback path is GET /events.
     const payload = JSON.stringify(["EVENT", statusEvent]);
-    for (const conn of this.conns) {
-      if (conn.ws.readyState === WebSocket.OPEN) {
-        try {
-          conn.ws.send(payload);
-        } catch { /* ignore */ }
-      }
+    for (const url of this.relayUrls) {
+      try {
+        const ws = new WebSocket(url);
+        ws.addEventListener("open", () => {
+          ws.send(payload);
+          setTimeout(() => { try { ws.close(); } catch { /* noop */ } }, 1500);
+        });
+      } catch { /* best-effort */ }
     }
   }
 
@@ -632,6 +626,23 @@ export class RelayWatcher {
     if (this.eventLog.length > MAX_EVENTS) {
       this.eventLog = this.eventLog.slice(-Math.floor(MAX_EVENTS / 2));
     }
+    this.persistLog();
+  }
+
+  // The DO is evicted seconds after its last request/alarm — anything held
+  // only in memory (the whole event log) dies with the instance and the FE
+  // would see an empty /events right when it needs the verdict. Storage is
+  // the source of truth; memory is just this instance's cache.
+  private persistLog(): void {
+    void this.state.storage.put("eventLog", this.eventLog).catch((e) =>
+      console.log(`[watcher] log persist failed: ${String(e).slice(0, 80)}`),
+    );
+  }
+
+  private async hydrateLog(): Promise<void> {
+    if (this.eventLog.length > 0) return;
+    const stored = await this.state.storage.get<EventRecord[]>("eventLog");
+    if (stored) this.eventLog = stored;
   }
 
   // ── Build signed NEAR transaction ───────────────────────────────────
@@ -717,12 +728,10 @@ export class RelayWatcher {
   // ── Lifecycle ────────────────────────────────────────────────────────
 
   async alarm() {
-    // Reconnect any relay that isn't open, then re-arm to keep the loop alive.
-    for (const url of this.relayUrls) {
-      const conn = this.conns.find((c) => c.url === url);
-      if (!conn || conn.ws.readyState !== WebSocket.OPEN) this.connectRelay(url);
-    }
-    await this.state.storage.setAlarm(Date.now() + 30_000).catch(() => {});
+    // Poll every relay for new events, then re-arm. Fresh socket per cycle —
+    // no zombie connections, and DO eviction between alarms costs nothing.
+    await this.pollAll();
+    await this.state.storage.setAlarm(Date.now() + 20_000).catch(() => {});
   }
 }
 
