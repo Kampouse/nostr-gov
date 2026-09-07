@@ -117,16 +117,47 @@ export async function fetchProfiles(pubkeys: string[]): Promise<Map<string, User
 }
 
 // ── Feed ──
+// First-EOSE strategy: resolve as soon as the fastest relay finishes, with a
+// short grace window so slower relays can still contribute events. This keeps
+// mobile (high-latency, one bad relay) from blocking the whole feed, unlike
+// pool.querySync which waits for every relay.
 export async function fetchGovernanceFeed(limit = 50): Promise<Event[]> {
-  const events = await pool.querySync(READ_RELAYS, {
-    kinds: [1],
-    "#t": ["nostrgov"],
-    limit,
+  return new Promise((resolve) => {
+    const collected: Event[] = [];
+    const seen = new Set<string>();
+    let eoseCount = 0;
+    let settled = false;
+    let grace: ReturnType<typeof setTimeout> | null = null;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (grace) clearTimeout(grace);
+      sub.close();
+      resolve(
+        collected
+          .filter((e) => { if (seen.has(e.id)) return false; seen.add(e.id); return true; })
+          .sort((a, b) => b.created_at - a.created_at),
+      );
+    };
+
+    const sub = pool.subscribeMany(READ_RELAYS, {
+      kinds: [1],
+      "#t": ["nostrgov"],
+      limit,
+    }, {
+      onevent(e: Event) {
+        if (!seen.has(e.id)) { seen.add(e.id); collected.push(e); }
+      },
+      oneose() {
+        eoseCount++;
+        if (eoseCount === 1) grace = setTimeout(finish, 2_000);
+        if (eoseCount >= READ_RELAYS.length) finish(); // all done before grace expired
+      },
+    });
+
+    setTimeout(finish, 8_000); // hard cap for the slowest mobile path
   });
-  const seen = new Set<string>();
-  return events
-    .filter((e) => { if (seen.has(e.id)) return false; seen.add(e.id); return true; })
-    .sort((a, b) => b.created_at - a.created_at);
 }
 
 // ── Reactions (kind 7) ──
