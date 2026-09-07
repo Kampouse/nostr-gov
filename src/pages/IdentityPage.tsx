@@ -3,7 +3,7 @@
  */
 
 import { useState, useEffect } from "react";
-import { Shield, ShieldCheck, Copy, Check, Wallet, LogOut, ExternalLink, RotateCcw } from "lucide-react";
+import { Shield, ShieldCheck, Copy, Check, Wallet, LogOut, ExternalLink } from "lucide-react";
 import { useAuth } from "../hooks/useAuth";
 import { useNear } from "../hooks/useNearWallet";
 import { fetchAllBindingsCached } from "../lib/binding";
@@ -199,7 +199,7 @@ export default function IdentityPage() {
           onClick={disconnect}
           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[10px] text-[11px] font-medium text-red border border-red/25 bg-transparent cursor-pointer transition-colors hover:bg-red/10"
         >
-          <RotateCcw size={13} /> Remove key
+          <LogOut size={13} /> Log out
         </button>
       </div>
     </div>

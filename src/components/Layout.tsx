@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { MessageSquare, Shield, Landmark, WifiOff } from 'lucide-react';
+import { MessageSquare, Shield, Landmark, WifiOff, LogOut } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 
 interface LayoutProps {
@@ -14,7 +14,7 @@ const tabs = [
 ] as const;
 
 export function Layout({ children }: LayoutProps) {
-  const { sessionAlive, pubkey } = useAuth();
+  const { sessionAlive, pubkey, npub, disconnect } = useAuth();
 
   return (
     <div className="flex min-h-dvh flex-col bg-bg">
@@ -24,6 +24,24 @@ export function Layout({ children }: LayoutProps) {
           <WifiOff className="h-3.5 w-3.5" />
           Reconnecting…
         </div>
+      )}
+
+      {/* Top bar — always-visible logout */}
+      {pubkey && (
+        <header className="flex h-12 shrink-0 items-center justify-between border-b border-brd bg-surface px-4">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="text-[13px] font-bold tracking-tight text-text">nostr-gov</span>
+            <span className="truncate font-mono text-[10px] text-text4">{npub.slice(0, 16)}…</span>
+          </div>
+          <button
+            onClick={disconnect}
+            title="Log out"
+            aria-label="Log out"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] text-text3 transition-colors hover:bg-red/10 hover:text-red active:bg-red/15"
+          >
+            <LogOut className="h-4.5 w-4.5" />
+          </button>
+        </header>
       )}
 
       {/* Main content */}
