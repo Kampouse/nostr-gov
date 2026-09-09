@@ -525,6 +525,27 @@ function TreasuryLevel({
   const isAdmin = onChainAdmin || (localOwner && (t?.adminPks.length ?? 0) === 0);
   const [newWallet, setNewWallet] = useState("");
   const [creatingWallet, setCreatingWallet] = useState(false);
+  const [upgrading, setUpgrading] = useState(false);
+
+  const handleUpgrade = async () => {
+    if (!wallet || !accountId) return;
+    setUpgrading(true);
+    try {
+      const wasmRes = await fetch("/nostr-gov.wasm");
+      if (!wasmRes.ok) throw new Error(`Failed to fetch wasm (${wasmRes.status})`);
+      const wasmBytes = new Uint8Array(await wasmRes.arrayBuffer());
+      await wallet.signAndSendTransaction({
+        receiverId: contractId,
+        actions: [{ type: "DeployContract", params: { code: wasmBytes } }],
+      });
+      toast("ok", `Contract upgraded on ${contractId}`);
+      refetch();
+    } catch (e: any) {
+      toast("err", e.message?.slice(0, 180) || "upgrade failed");
+    } finally {
+      setUpgrading(false);
+    }
+  };
 
   const handleCreateWallet = async () => {
     if (!wallet || !t || !accountId) return;
@@ -602,6 +623,21 @@ function TreasuryLevel({
           </div>
           {!wallet && <div className="text-text4 text-[10px] mt-1.5">Connect a NEAR wallet (HOT) to send the transaction.</div>}
           {!canSign && wallet && <div className="text-text4 text-[10px] mt-1.5">Sign in with nsec / bunker to sign the admin event.</div>}
+        </div>
+      )}
+
+      {/* upgrade contract (admin) */}
+      {isAdmin && (
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleUpgrade}
+            disabled={upgrading || !wallet}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[8px] text-[11px] font-semibold bg-surface border border-brd text-text3 cursor-pointer hover:border-neon/50 hover:text-text1 disabled:opacity-40"
+          >
+            {upgrading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+            Upgrade contract
+          </button>
+          <span className="text-text4 text-[10px]">Deploy latest WASM · {t ? `v${t.version}` : "?"} → v2</span>
         </div>
       )}
 
