@@ -33,6 +33,7 @@ import {
   buildGovEnvelope,
 } from "../lib/schnorr";
 import { DEFAULT_TREASURY, RELAYER_RELAYS, RELAYER_WATCHER_URL } from "../lib/constants";
+import { fetchChainTreasuries } from "../lib/treasury-discovery";
 import { pool } from "../lib/nostr";
 import type { Event } from "nostr-tools";
 import { LoginScreen } from "../components/LoginScreen";
@@ -1145,6 +1146,33 @@ export default function GovernancePage() {
   // drill-down: treasury → wallet → proposal
   const [sel, setSel] = useState<{ t: string | null; w: string | null; p: string | null }>({ t: null, w: null, p: null });
   const [treasuries, setTreasuries] = useState<string[]>(getTreasuries);
+  const [chainSynced, setChainSynced] = useState<"idle" | "syncing" | "done">("idle");
+
+  // chain discovery: the localStorage list only knows what THIS browser
+  // created — fetch the account's actual treasuries from chain (indexer scan
+  // + live get_version probe) and merge. New device/browser now recovers
+  // every treasury the account ever deployed.
+  useEffect(() => {
+    if (!accountId) return;
+    let cancelled = false;
+    setChainSynced("syncing");
+    fetchChainTreasuries(accountId, getContractVersion)
+      .then((onChain) => {
+        if (cancelled) return;
+        // chain first (source of truth), then localStorage-only entries
+        // (third-party treasuries the user added, or older than the indexer
+        // window), then the default — deduped.
+        const local = getTreasuries().filter((t) => t !== DEFAULT_TREASURY);
+        const merged = [...onChain, ...local.filter((t) => !onChain.includes(t))];
+        if (!merged.includes(DEFAULT_TREASURY)) merged.unshift(DEFAULT_TREASURY);
+        setTreasuries(merged);
+        // persist the recovered set so offline loads see it too
+        try { localStorage.setItem("nostrgov-treasuries", JSON.stringify(merged)); } catch { /* private mode */ }
+        setChainSynced("done");
+      })
+      .catch(() => !cancelled && setChainSynced("done"));
+    return () => { cancelled = true; };
+  }, [accountId]);
   const [showCreate, setShowCreate] = useState(false);
   const [useRelayer, setUseRelayer] = useState(true);
 
@@ -1173,7 +1201,7 @@ export default function GovernancePage() {
       {/* body: either the list, or the drill-down level */}
       {sel.t === null ? (
         <div className="p-2">
-          <div className="px-2 pb-2 text-text4 text-[10px] truncate">wallet: {accountId ?? "connecting…"} · {canSign ? "nostr signer ready" : "nostr read-only"}</div>
+          <div className="px-2 pb-2 text-text4 text-[10px] truncate">wallet: {accountId ?? "connecting…"} · {canSign ? "nostr signer ready" : "nostr read-only"}{chainSynced === "syncing" ? " · syncing treasuries from chain…" : chainSynced === "done" ? " · treasuries synced from chain" : ""}</div>
           {treasuries.map(id => (
             <TreasuryListRow
               key={id}
