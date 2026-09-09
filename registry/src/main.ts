@@ -65,13 +65,11 @@ function listMember(list: string, item: string) {
 // ── public interface ────────────────────────────────────────────────────
 
 export function get_version() {
-  near.jsonReturnStr("1");
-  return 0;
+  return "1";
 }
 
 export function count() {
-  near.jsonReturnStr(numStr("n"));
-  return 0;
+  return numStr("n");
 }
 
 // register { treasury: "gov.alice.testnet", npub?: "64hex" }
@@ -137,8 +135,7 @@ export function unregister() {
 
 export function list_by_owner() {
   const owner = near.jsonGetStr("account_id") ?? "";
-  near.jsonReturnStr(getStr(ownerKey(owner)));
-  return 0;
+  return getStr(ownerKey(owner));
 }
 
 export function list_all() {
@@ -152,8 +149,7 @@ export function list_all() {
     }
     i = i + 1;
   }
-  near.jsonReturnStr(out);
-  return 0;
+  return out;
 }
 
 function setStr(k: string, v: string) {

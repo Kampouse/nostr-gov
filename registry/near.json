@@ -1,0 +1,8 @@
+{
+  "name": "registry",
+  "src": "src/main.ts",
+  "account": "registry-nostrgov.testnet",
+  "network": "testnet",
+  "output": "target/registry.wasm",
+  "tests": "tests/"
+}

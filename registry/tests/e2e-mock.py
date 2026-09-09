@@ -25,6 +25,8 @@ def call(state, method, args, signer, dep="", view=False):
     blob = out.stdout + out.stderr
     ok = out.returncode == 0 and "LOG: ERR_" not in blob
     ret = next((l[2:].strip() for l in blob.splitlines() if l.startswith("📄 ")), "")
+    if method == "list_all":
+        ret = blob  # multi-line return — check against the whole output
     err = next((l.split("LOG: ")[1].strip() for l in blob.splitlines()
                 if "LOG: ERR_" in l), "")
     return ok, ret, err
@@ -77,10 +79,10 @@ def main():
         def r(n): return by[n][1]
 
         checks = [
-            ("version", lambda: '"1"' in r("version")),
+            ("version", lambda: "1" in r("version").strip('" ')),
             ("register x3", lambda: all(by[n][0] for n in
                 ("register alice/gov", "register alice/team", "register bob/vault"))),
-            ("count==3", lambda: '"3"' in r("count=3")),
+            ("count==3", lambda: "3" in r("count=3").strip('" ')),
             ("alice list has both", lambda:
                 f"gov.{A}" in r("list alice") and f"team.{A}" in r("list alice")),
             ("bob list isolated", lambda:
