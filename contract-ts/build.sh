@@ -13,25 +13,31 @@ SRC="$HERE/src/main.ts"
 # resolve lisp-rlm root
 LR="${LISP_RLM_ROOT:-}"
 if [ -z "$LR" ]; then
-  for c in "$HERE/../lisp-rlm" "$HOME/dev/lisp-rlm" "$HOME/.openclaw/workspace/lisp-rlm"; do
+  for c in "$HERE/../lisp-rlm" "$HERE/../../lisp-rlm" "$HOME/dev/lisp-rlm" \
+           "$HOME/dev/stuff/lisp-rlm" "$HOME/.openclaw/workspace/lisp-rlm"; do
     [ -d "$c" ] && LR="$c" && break
   done
 fi
-[ -n "$LR" ] && NC="$LR/target/release/near-compile"
-[ -n "$LR" ] && [ -x "$NC" ] || NC="$LR/target/debug/near-compile"
-if [ -z "$NC" ] || [ ! -x "$NC" ]; then
-  echo "→ building lisp-rlm compiler at $LR (cargo build --release --bin near-compile; falls back to debug)"
-  cargo build --manifest-path "$LR/Cargo.toml" --release --bin near-compile \
-    || cargo build --manifest-path "$LR/Cargo.toml" --bin near-compile
+
+# pick a compiler binary: release → debug → installed (cargo install
+# near-compile) → build from source as a last resort
+NC=""
+if [ -n "$LR" ]; then
   NC="$LR/target/release/near-compile"
   [ -x "$NC" ] || NC="$LR/target/debug/near-compile"
 fi
-[ -n "$NC" ] && [ -x "$NC" ] || { echo "✗ near-compile not found (set LISP_RLM_ROOT)"; exit 1; }
-# alt: the standalone crate — cargo install near-compile (v0.1.1+ has the TS dispatch)
-if ! [ -x "$NC" ]; then
-  command -v near-compile >/dev/null 2>&1 && NC="$(command -v near-compile)"
+if [ -z "$NC" ] || [ ! -x "$NC" ]; then
+  if command -v near-compile >/dev/null 2>&1; then
+    NC="$(command -v near-compile)"
+  elif [ -n "$LR" ]; then
+    echo "→ building near-compile at $LR (cargo build --release; falls back to debug)"
+    cargo build --manifest-path "$LR/Cargo.toml" --release --bin near-compile \
+      || cargo build --manifest-path "$LR/Cargo.toml" --bin near-compile
+    NC="$LR/target/release/near-compile"
+    [ -x "$NC" ] || NC="$LR/target/debug/near-compile"
+  fi
 fi
-[ -x "$NC" ] || { echo "✗ near-compile binary not found (set LISP_RLM_ROOT or cargo install near-compile)"; exit 1; }
+[ -n "$NC" ] && [ -x "$NC" ] || { echo "✗ near-compile not found (set LISP_RLM_ROOT or cargo install near-compile)"; exit 1; }
 
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT"
@@ -43,5 +49,14 @@ if command -v wasm-opt >/dev/null 2>&1; then
   wasm-opt --enable-bulk-memory-opt -g -Oz "$OUT" -o "$OUT.opt" \
     && wasm-tools validate "$OUT.opt" 2>/dev/null || true
   if [ -f "$OUT.opt" ]; then mv "$OUT.opt" "$OUT"; fi
+fi
+
+# sync the web app's bundled binary (public/nostr-gov.wasm) so the UI's
+# one-click treasury deployment always ships THIS build — no drift.
+# The web e2e gates it: NEAR_GOV_WASM=../public/nostr-gov.wasm python3
+# tests/e2e-mock.py must be ALL GREEN before committing.
+if [ -d "$HERE/../public" ]; then
+  cp "$OUT" "$HERE/../public/nostr-gov.wasm"
+  echo "📋 synced → ../public/nostr-gov.wasm ($(wc -c < "$HERE/../public/nostr-gov.wasm" | tr -d ' ') bytes)"
 fi
 echo "✅ contract ready: $OUT ($(wc -c < "$OUT" | tr -d ' ') bytes)"

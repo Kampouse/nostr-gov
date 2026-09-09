@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bip340 import sign, event_id, sha, i2b, mul, b2i  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WASM = os.path.abspath(os.path.join(HERE, "..", "target", "nostr-gov-ts.wasm"))
+WASM = os.environ.get(
+    "NEAR_GOV_WASM",
+    os.path.abspath(os.path.join(HERE, "..", "target", "nostr-gov-ts.wasm")))
 
 NM = os.environ.get("NEAR_MOCK", shutil.which("near-mock") or "")
 GOV = 37500
