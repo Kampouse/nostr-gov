@@ -36,14 +36,18 @@ sent = lambda s: s.replace('"', "~")      # sentinel transport (e2e convention)
 
 
 def ev(action, nonce):
-    """Signed admin governance event, sentinel-encoded tags."""
+    """Signed admin governance event.
+    Tags travel as real JSON (no sentinel) — JSON.stringify and the
+    contract's naive concat produce identical bytes for a JSON array.
+    Content uses sentinel (~ for ") for gov envelopes; plain text for
+    admin actions. We sign over the same bytes the contract will hash."""
     tags = (f'[["t","nostr-gov"],["action","{action}"],["nonce","{nonce}"],'
             f'["expires","{EX}"],["contract","{C}"]]')
     ct = "nostr-gov owner action"
     eid = event_id(OPK, 1, GOV, json.loads(tags), ct)
     ser = f'[0,"{OPK}",1,{GOV},{tags},"{ct}"]'
     return {"pk": OPK, "ev": eid, "cat": "1", "kind": str(GOV),
-            "tags": sent(tags), "ct": ct, "sig": sign(OSK, sha(ser.encode())).hex()}
+            "tags": tags, "ct": ct, "sig": sign(OSK, sha(ser.encode())).hex()}
 
 
 class Chain:

@@ -252,8 +252,13 @@ function walThr(name: string): string {
 function verifyOwnerEvent(actionStr: string) {
   const pk = near.jsonGetStr("pk") ?? "";
   const kind = near.jsonGetStr("kind") ?? "";
-  const tags = unsentinel(near.jsonGetStr("tags") ?? "");
-  const content = unsentinel(near.jsonGetStr("ct") ?? "");
+  // Tags travel as real JSON — no sentinel needed (the contract's naive
+  // concat produces the same bytes as JSON.stringify for a JSON array).
+  // Content uses sentinel (~ for ") for gov envelopes — the signed bytes
+  // have ~, so the hash must use ~ too. Unsentinel is only for parsing.
+  const tags = near.jsonGetStr("tags") ?? "";
+  const rawCt = near.jsonGetStr("ct") ?? "";
+  const content = unsentinel(rawCt);
   const sig = near.jsonGetStr("sig") ?? "";
   const cat = near.jsonGetStr("cat") ?? "";
   if (strLength(pk) !== 64) {
@@ -282,7 +287,7 @@ function verifyOwnerEvent(actionStr: string) {
   if (tc !== near.currentAccountId()) {
     die("ERR_EVENT_CONTRACT");
   }
-  const serialized = eventSerialize(pk, cat, kind, tags, content);
+  const serialized = eventSerialize(pk, cat, kind, tags, rawCt);
   const pkb = hexDecode(pk);
   const sigb = hexDecode(sig);
   const mh = hexDecode(sha256Hash(serialized));
@@ -298,8 +303,9 @@ function verifyOwnerEvent(actionStr: string) {
 function verifyGuardianEvent(actionStr: string) {
   const pk = near.jsonGetStr("pk") ?? "";
   const kind = near.jsonGetStr("kind") ?? "";
-  const tags = unsentinel(near.jsonGetStr("tags") ?? "");
-  const content = unsentinel(near.jsonGetStr("ct") ?? "");
+  const tags = near.jsonGetStr("tags") ?? "";
+  const rawCt = near.jsonGetStr("ct") ?? "";
+  const content = unsentinel(rawCt);
   const sig = near.jsonGetStr("sig") ?? "";
   const cat = near.jsonGetStr("cat") ?? "";
   if (strLength(pk) !== 64) {
@@ -327,7 +333,7 @@ function verifyGuardianEvent(actionStr: string) {
   if (tc !== near.currentAccountId()) {
     die("ERR_EVENT_CONTRACT");
   }
-  const serialized = eventSerialize(pk, cat, kind, tags, content);
+  const serialized = eventSerialize(pk, cat, kind, tags, rawCt);
   const pkb = hexDecode(pk);
   const sigb = hexDecode(sig);
   const mh = hexDecode(sha256Hash(serialized));
@@ -614,11 +620,13 @@ export function approve_with_event() {
   const pk = near.jsonGetStr("pk") ?? "";
   const sig = near.jsonGetStr("sig") ?? "";
   const kind = near.jsonGetStr("kind") ?? "";
-  const tags = unsentinel(near.jsonGetStr("tags") ?? "");
-  const ct = unsentinel(near.jsonGetStr("ct") ?? "");
+  // Tags are real JSON (no sentinel). Content may have ~ for gov envelopes.
+  const tags = near.jsonGetStr("tags") ?? "";
+  const rawCt = near.jsonGetStr("ct") ?? "";
   if (kind !== "37500") {
     die("ERR_EVENT_KIND");
   }
+  const ct = unsentinel(rawCt);
   if (tagGet(tags, "contract") !== near.currentAccountId()) {
     die("ERR_EVENT_CONTRACT");
   }
@@ -647,7 +655,8 @@ export function approve_with_event() {
     die("ERR_EVENT_CONTENT");
   }
   const p = approveChecks(name, id, ix, pk, exp);
-  const serialized = eventSerialize(pk, cat, kind, tags, ct);
+  // Hash uses raw (sentinel) content — the event was signed over those bytes.
+  const serialized = eventSerialize(pk, cat, kind, tags, rawCt);
   const ok = schnorrVerify(hexDecode(pk), hexDecode(sig), hexDecode(sha256Hash(serialized)));
   if (ok !== 1) {
     die("ERR_EVENT_SIG_INVALID");
