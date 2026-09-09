@@ -3,7 +3,7 @@
  * All functions take contractId param (no hardcoded contract).
  */
 
-import { NEAR_RPC } from "./constants";
+import { NEAR_RPC, REGISTRY_CONTRACT } from "./constants";
 import { buildGovEvent, extractEventFields, defaultExpiryNs } from "./schnorr";
 
 async function rpcCall(method: string, params: Record<string, unknown> | unknown[]): Promise<any> {
@@ -151,6 +151,21 @@ async function viewStr(contractId: string, method: string, args: Record<string, 
 
 export async function getContractVersion(contractId: string): Promise<string> {
   return viewStr(contractId, "get_version", {});
+}
+
+// ── treasury registry ───────────────────────────────────────────────────
+
+export function registryListByOwner(accountId: string): Promise<string> {
+  return viewStr(REGISTRY_CONTRACT, "list_by_owner", { account_id: accountId });
+}
+
+export async function registryIsLive(): Promise<boolean> {
+  try {
+    const v = await getContractVersion(REGISTRY_CONTRACT);
+    return v !== null && v !== "";
+  } catch {
+    return false;
+  }
 }
 
 export async function getOwnerNonce(contractId: string): Promise<number> {

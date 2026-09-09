@@ -36,6 +36,11 @@ export const NEAR_NETWORK_ID = "testnet";
 // ── nostr-msig (testnet) ──
 export const DEFAULT_TREASURY = "gov.anon372340656.testnet";
 
+// The on-chain treasury registry (deployed from public/registry.wasm —
+// see registry/). Treasuries register at creation; list_by_owner is the
+// authoritative discovery source (replaces indexer/localStorage-first).
+export const REGISTRY_CONTRACT = "registry.nostrogov.testnet";
+
 // ── Relayer watcher ──
 export const RELAYER_WATCHER_URL = "https://nostr-relay-watcher.kj95hgdgnn.workers.dev";
 export const RELAYER_RELAYS = ["wss://relay.primal.net", "wss://nos.lol", "wss://relay.damus.io"];

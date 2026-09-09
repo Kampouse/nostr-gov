@@ -26,13 +26,14 @@ import {
   getOwnerNpubs, getEventNonce, getContractVersion, isPaused,
   getProposalsPaginated, getProposalMessage, listWallets,
   proposeProposal, signGovEvent, verifyTxSuccess, withTimeout,
+  registryListByOwner, registryIsLive,
   type Wallet, type Proposal,
 } from "../lib/near";
 import {
   schnorrSign, defaultExpiryNs, buildApprovalEvent, extractEventFields,
   buildGovEnvelope,
 } from "../lib/schnorr";
-import { DEFAULT_TREASURY, RELAYER_RELAYS, RELAYER_WATCHER_URL } from "../lib/constants";
+import { DEFAULT_TREASURY, REGISTRY_CONTRACT, RELAYER_RELAYS, RELAYER_WATCHER_URL } from "../lib/constants";
 import { fetchChainTreasuries } from "../lib/treasury-discovery";
 import { pool } from "../lib/nostr";
 import type { Event } from "nostr-tools";
@@ -380,14 +381,33 @@ function CreateTreasuryModal({
       if (!wasmRes.ok) throw new Error(`Failed to fetch wasm (${wasmRes.status})`);
       const wasmBytes = new Uint8Array(await wasmRes.arrayBuffer());
 
+      // atomic registration: same batch as the deployment, so the registry
+      // and the treasury can never drift. Skipped (with a warning) when the
+      // registry isn't deployed yet — creation must not hard-depend on it.
+      const actions: any[] = [
+        { type: "CreateAccount" },
+        { type: "Transfer", params: { deposit: CREATE_TREASURY_DEPOSIT } },
+        { type: "DeployContract", params: { code: wasmBytes } },
+        { type: "FunctionCall", params: { methodName: "init", args: { npub: ownerNpub }, gas: "300000000000000", deposit: "0" } },
+      ];
+      let registered = false;
+      if (await registryIsLive()) {
+        actions.push({
+          type: "FunctionCall",
+          receiverId: REGISTRY_CONTRACT,
+          params: {
+            methodName: "register",
+            args: { treasury: treasuryId, npub: ownerNpub },
+            gas: "100000000000000",
+            deposit: "20000000000000000000000", // 0.02 Ⓝ — registry storage staking
+          },
+        });
+        registered = true;
+      }
+
       const tx = await walletObj.signAndSendTransaction({
         receiverId: treasuryId,
-        actions: [
-          { type: "CreateAccount" },
-          { type: "Transfer", params: { deposit: CREATE_TREASURY_DEPOSIT } },
-          { type: "DeployContract", params: { code: wasmBytes } },
-          { type: "FunctionCall", params: { methodName: "init", args: { npub: ownerNpub }, gas: "300000000000000", deposit: "0" } },
-        ],
+        actions,
       });
       // verify receipts on-chain before claiming success
       const hash = tx?.transaction?.hash ?? tx?.transactionHash;
@@ -396,6 +416,9 @@ function CreateTreasuryModal({
       saveTreasury(treasuryId);
       saveTreasuryOwner(treasuryId, ownerNpub);
       toast("ok", `Treasury ${treasuryId} created — ${hash.slice(0, 8)}…`);
+      if (!registered) {
+        toast("err", "Registry not deployed — treasury saved locally only (see registry/README)");
+      }
       onCreated(treasuryId);
       onClose();
     } catch (e: any) {
@@ -1148,29 +1171,42 @@ export default function GovernancePage() {
   const [treasuries, setTreasuries] = useState<string[]>(getTreasuries);
   const [chainSynced, setChainSynced] = useState<"idle" | "syncing" | "done">("idle");
 
-  // chain discovery: the localStorage list only knows what THIS browser
-  // created — fetch the account's actual treasuries from chain (indexer scan
-  // + live get_version probe) and merge. New device/browser now recovers
-  // every treasury the account ever deployed.
+  // chain discovery — REGISTRY FIRST (the authoritative on-chain list;
+  // see registry/), indexer scan demoted to legacy fallback for
+  // pre-registry treasuries, localStorage for third-party adds:
+  //   1. registry list_by_owner (deployed registry, any device)
+  //   2. NearBlocks indexer scan (legacy treasuries created before the
+  //      registry existed — still better than losing them)
+  //   3. localStorage cache
+  //   4. DEFAULT_TREASURY
   useEffect(() => {
     if (!accountId) return;
     let cancelled = false;
     setChainSynced("syncing");
-    fetchChainTreasuries(accountId, getContractVersion)
-      .then((onChain) => {
-        if (cancelled) return;
-        // chain first (source of truth), then localStorage-only entries
-        // (third-party treasuries the user added, or older than the indexer
-        // window), then the default — deduped.
-        const local = getTreasuries().filter((t) => t !== DEFAULT_TREASURY);
-        const merged = [...onChain, ...local.filter((t) => !onChain.includes(t))];
-        if (!merged.includes(DEFAULT_TREASURY)) merged.unshift(DEFAULT_TREASURY);
-        setTreasuries(merged);
-        // persist the recovered set so offline loads see it too
-        try { localStorage.setItem("nostrgov-treasuries", JSON.stringify(merged)); } catch { /* private mode */ }
-        setChainSynced("done");
-      })
-      .catch(() => !cancelled && setChainSynced("done"));
+    (async () => {
+      let onChain: string[] = [];
+      try {
+        const csv = await registryListByOwner(accountId);
+        const parsed = typeof csv === "string" && csv
+          ? csv.split(",").map((s) => s.trim()).filter(Boolean) : [];
+        // registry returns {result: "a,b"} JSON-encoded — extract if needed
+        const inner = parsed.length === 1 && parsed[0].startsWith("{")
+          ? (() => { try { return [JSON.parse(parsed[0]).result]; } catch { return parsed; } })()
+          : parsed;
+        onChain = (inner ?? []).filter(Boolean);
+      } catch { /* registry missing/unreachable — legacy paths below */ }
+      try {
+        const legacy = await fetchChainTreasuries(accountId, getContractVersion);
+        for (const t of legacy) if (!onChain.includes(t)) onChain.push(t);
+      } catch { /* indexer down — registry/local still apply */ }
+      if (cancelled) return;
+      const local = getTreasuries().filter((t) => t !== DEFAULT_TREASURY);
+      const merged = [...onChain, ...local.filter((t) => !onChain.includes(t))];
+      if (!merged.includes(DEFAULT_TREASURY)) merged.unshift(DEFAULT_TREASURY);
+      setTreasuries(merged);
+      try { localStorage.setItem("nostrgov-treasuries", JSON.stringify(merged)); } catch { /* private mode */ }
+      setChainSynced("done");
+    })();
     return () => { cancelled = true; };
   }, [accountId]);
   const [showCreate, setShowCreate] = useState(false);
