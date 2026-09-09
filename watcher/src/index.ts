@@ -98,14 +98,18 @@ const MAX_EVENTS = 500;
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [1000, 5000, 15000];
 
-// Multi-contract support: comma list in TREASURY_CONTRACT_IDS supersedes
-// TREASURY_CONTRACT_ID. 0-deposit rule: the relayer only ever submits
-// calls whose attached NEAR deposit is 0 (approve_with_event, propose,
-// execute). Payouts move the TREASURY's balance — the relayer only fronts
-// gas (<0.01 N). create_wallet (1.1 N deposit) is NOT relayable: gov
-// envelopes whitelist methods, so a relay event can never drain relayer
-// funds. The contract re-verifies the admin schnorr sig + nonce on-chain;
-// the watcher is a gas puppet that cannot forge or replay anything.
+// The watcher is trustless: the contract re-verifies the admin schnorr
+// sig + nonce on-chain, so the watcher cannot forge or replay anything.
+// It only pays gas (<0.01 N per call) on 0-deposit methods
+// (approve_with_event, propose, execute). The method whitelist in
+// parseGovernanceEvent ensures the relayer can never send funds — only
+// approve_with_event (0 deposit) and propose/execute via gov envelopes
+// (also 0 deposit; create_wallet needs 1.1 N and is explicitly blocked).
+//
+// TREASURY_CONTRACT_ID(S) are kept for the /health display only — they are
+// NOT a gate. Any kind-37500 event with a valid #contract tag is accepted
+// and routed to that contract. The on-chain sig check is the security
+// boundary, not this config list.
 const CONTRACT_IDS = (env: Env): string[] => {
   if (env.TREASURY_CONTRACT_IDS) {
     return env.TREASURY_CONTRACT_IDS.split(",").map((s) => s.trim()).filter(Boolean);
@@ -403,9 +407,8 @@ export class RelayWatcher {
   // Human-readable reason an event was dropped — powers the FE feedback.
   private dropReason(event: NostrEvent, contractTag: string | null): string {
     if (!contractTag) return "no #contract tag on event";
-    if (!CONTRACT_IDS(this.env).includes(contractTag)) {
-      return `treasury ${contractTag} is NOT watched — add it to TREASURY_CONTRACT_IDS`;
-    }
+    // contractTag is present but parseGovernanceEvent rejected it for
+    // a shape reason (bad envelope, missing tags, etc.)
     if (event.content.startsWith("gov:")) {
       try {
         const env = JSON.parse(event.content.slice(4).replaceAll("~", '"')) as GovEnvelope;
@@ -441,10 +444,14 @@ export class RelayWatcher {
     // Must be kind 37500
     if (event.kind !== GOVERNANCE_KIND) return null;
 
-    // Check #contract tag matches ANY watched treasury
+    // #contract tag is required — it tells the watcher which contract to
+    // submit to. Any valid NEAR account ID is accepted (must end in .testnet
+    // or .near); the contract verifies the schnorr sig on-chain, so the
+    // watcher is trustless. No whitelist needed.
     const contractTag = event.tags.find((t) => t[0] === "contract");
-    if (!contractTag || !CONTRACT_IDS(this.env).includes(contractTag[1])) return null;
+    if (!contractTag?.[1]) return null;
     const contractId = contractTag[1];
+    if (!contractId.endsWith(".testnet") && !contractId.endsWith(".near")) return null;
 
     // Shape B: gov envelope in signed content
     if (event.content.startsWith("gov:")) {
