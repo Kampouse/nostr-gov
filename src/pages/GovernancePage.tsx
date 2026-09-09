@@ -34,7 +34,7 @@ import {
   buildGovEnvelope,
 } from "../lib/schnorr";
 import { DEFAULT_TREASURY, REGISTRY_CONTRACT, RELAYER_RELAYS, RELAYER_WATCHER_URL } from "../lib/constants";
-import { fetchChainTreasuries } from "../lib/treasury-discovery";
+
 import { pool } from "../lib/nostr";
 import type { Event } from "nostr-tools";
 import { LoginScreen } from "../components/LoginScreen";
@@ -381,42 +381,46 @@ function CreateTreasuryModal({
       if (!wasmRes.ok) throw new Error(`Failed to fetch wasm (${wasmRes.status})`);
       const wasmBytes = new Uint8Array(await wasmRes.arrayBuffer());
 
-      // atomic registration: same batch as the deployment, so the registry
-      // and the treasury can never drift. Skipped (with a warning) when the
-      // registry isn't deployed yet — creation must not hard-depend on it.
-      const actions: any[] = [
+      // Two transactions in one wallet approval: deploy the treasury, then
+      // register it. signAndSendTransactions sends them as a batch — both
+      // succeed or both fail, so the registry and treasury can never drift.
+      const deployActions: any[] = [
         { type: "CreateAccount" },
         { type: "Transfer", params: { deposit: CREATE_TREASURY_DEPOSIT } },
         { type: "DeployContract", params: { code: wasmBytes } },
         { type: "FunctionCall", params: { methodName: "init", args: { npub: ownerNpub }, gas: "300000000000000", deposit: "0" } },
       ];
-      let registered = false;
-      if (await registryIsLive()) {
-        actions.push({
-          type: "FunctionCall",
-          receiverId: REGISTRY_CONTRACT,
-          params: {
-            methodName: "register",
-            args: { treasury: treasuryId, npub: ownerNpub },
-            gas: "100000000000000",
-            deposit: "20000000000000000000000", // 0.02 Ⓝ — registry storage staking
-          },
-        });
-        registered = true;
-      }
+      const registerActions: any[] = [{
+        type: "FunctionCall",
+        params: {
+          methodName: "register",
+          args: { treasury: treasuryId, npub: ownerNpub },
+          gas: "100000000000000",
+          deposit: "20000000000000000000000", // 0.02 Ⓝ — registry storage staking
+        },
+      }];
 
-      const tx = await walletObj.signAndSendTransaction({
-        receiverId: treasuryId,
-        actions,
-      });
-      // verify receipts on-chain before claiming success
-      const hash = tx?.transaction?.hash ?? tx?.transactionHash;
+      const registryLive = await registryIsLive();
+      const transactions = [
+        { receiverId: treasuryId, actions: deployActions },
+        ...(registryLive ? [{ receiverId: REGISTRY_CONTRACT, actions: registerActions }] : []),
+      ];
+
+      const results = await walletObj.signAndSendTransactions({ transactions });
+      // verify the deploy tx (first result)
+      const deployTx = results?.[0];
+      const hash = deployTx?.transaction?.hash ?? deployTx?.transactionHash;
       if (!hash) throw new Error("No tx hash returned by wallet");
       await verifyTxSuccess(hash, accountId);
+      // verify the register tx (second result) if it exists
+      if (results?.[1]) {
+        const regHash = results[1].transaction?.hash ?? results[1].transactionHash;
+        if (regHash) await verifyTxSuccess(regHash, accountId);
+      }
       saveTreasury(treasuryId);
       saveTreasuryOwner(treasuryId, ownerNpub);
-      toast("ok", `Treasury ${treasuryId} created — ${hash.slice(0, 8)}…`);
-      if (!registered) {
+      toast("ok", `Treasury ${treasuryId} created`);
+      if (!registryLive) {
         toast("err", "Registry not deployed — treasury saved locally only (see registry/README)");
       }
       onCreated(treasuryId);
@@ -1171,14 +1175,12 @@ export default function GovernancePage() {
   const [treasuries, setTreasuries] = useState<string[]>(getTreasuries);
   const [chainSynced, setChainSynced] = useState<"idle" | "syncing" | "done">("idle");
 
-  // chain discovery — REGISTRY FIRST (the authoritative on-chain list;
-  // see registry/), indexer scan demoted to legacy fallback for
-  // pre-registry treasuries, localStorage for third-party adds:
-  //   1. registry list_by_owner (deployed registry, any device)
-  //   2. NearBlocks indexer scan (legacy treasuries created before the
-  //      registry existed — still better than losing them)
-  //   3. localStorage cache
-  //   4. DEFAULT_TREASURY
+  // chain discovery — the registry IS the source of truth (deployed
+  // live at registry-nostrgov.testnet). localStorage caches third-party
+  // adds across sessions:
+  //   1. registry list_by_owner (authoritative, any device)
+  //   2. localStorage cache (third-party treasuries)
+  //   3. DEFAULT_TREASURY
   useEffect(() => {
     if (!accountId) return;
     let cancelled = false;
@@ -1187,18 +1189,10 @@ export default function GovernancePage() {
       let onChain: string[] = [];
       try {
         const csv = await registryListByOwner(accountId);
-        const parsed = typeof csv === "string" && csv
+        onChain = typeof csv === "string" && csv
           ? csv.split(",").map((s) => s.trim()).filter(Boolean) : [];
-        // registry returns {result: "a,b"} JSON-encoded — extract if needed
-        const inner = parsed.length === 1 && parsed[0].startsWith("{")
-          ? (() => { try { return [JSON.parse(parsed[0]).result]; } catch { return parsed; } })()
-          : parsed;
-        onChain = (inner ?? []).filter(Boolean);
-      } catch { /* registry missing/unreachable — legacy paths below */ }
-      try {
-        const legacy = await fetchChainTreasuries(accountId, getContractVersion);
-        for (const t of legacy) if (!onChain.includes(t)) onChain.push(t);
-      } catch { /* indexer down — registry/local still apply */ }
+      } catch { /* registry missing/unreachable — localStorage fallback below */ }
+
       if (cancelled) return;
       const local = getTreasuries().filter((t) => t !== DEFAULT_TREASURY);
       const merged = [...onChain, ...local.filter((t) => !onChain.includes(t))];

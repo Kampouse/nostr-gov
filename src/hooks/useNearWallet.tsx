@@ -14,6 +14,7 @@ interface NearState {
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   signAndSendTransaction: (params: any) => Promise<any>;
+  signAndSendTransactions: (params: any) => Promise<any>;
 }
 
 const NearContext = createContext<NearState | null>(null);
@@ -85,8 +86,13 @@ export function NearProvider({ children }: { children: ReactNode }) {
     return w.signAndSendTransaction(params);
   }, [wallet]);
 
+  const signAndSendTransactions = useCallback(async (params: any) => {
+    const w = wallet ?? await connectorRef.current.wallet();
+    return w.signAndSendTransactions(params);
+  }, [wallet]);
+
   return (
-    <NearContext.Provider value={{ accountId, publicKey, connecting, wallet, connect, disconnect, signAndSendTransaction }}>
+    <NearContext.Provider value={{ accountId, publicKey, connecting, wallet, connect, disconnect, signAndSendTransaction, signAndSendTransactions }}>
       {children}
     </NearContext.Provider>
   );
