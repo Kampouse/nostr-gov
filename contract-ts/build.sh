@@ -17,15 +17,25 @@ if [ -z "$LR" ]; then
     [ -d "$c" ] && LR="$c" && break
   done
 fi
-[ -n "$LR" ] && [ -x "$LR/target/release/compile" ] || {
-  echo "→ building lisp-rlm compiler at $LR (first run: cargo build --release --bin compile)"
-  cargo build --manifest-path "$LR/Cargo.toml" --release --bin compile
-}
-[ -x "$LR/target/release/compile" ] || { echo "✗ lisp-rlm compiler not found (set LISP_RLM_ROOT)"; exit 1; }
+[ -n "$LR" ] && NC="$LR/target/release/near-compile"
+[ -n "$LR" ] && [ -x "$NC" ] || NC="$LR/target/debug/near-compile"
+if [ -z "$NC" ] || [ ! -x "$NC" ]; then
+  echo "→ building lisp-rlm compiler at $LR (cargo build --release --bin near-compile; falls back to debug)"
+  cargo build --manifest-path "$LR/Cargo.toml" --release --bin near-compile \
+    || cargo build --manifest-path "$LR/Cargo.toml" --bin near-compile
+  NC="$LR/target/release/near-compile"
+  [ -x "$NC" ] || NC="$LR/target/debug/near-compile"
+fi
+[ -n "$NC" ] && [ -x "$NC" ] || { echo "✗ near-compile not found (set LISP_RLM_ROOT)"; exit 1; }
+# alt: the standalone crate — cargo install near-compile (v0.1.1+ has the TS dispatch)
+if ! [ -x "$NC" ]; then
+  command -v near-compile >/dev/null 2>&1 && NC="$(command -v near-compile)"
+fi
+[ -x "$NC" ] || { echo "✗ near-compile binary not found (set LISP_RLM_ROOT or cargo install near-compile)"; exit 1; }
 
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT"
-"$LR/target/release/compile" "$SRC" "$OUT" 2>&1 | grep -vE '^(START|Reading|Parsed)' || true
+"$NC" "$SRC" "$OUT" 2>&1 | grep -vE '^(START|Reading|Parsed)' || true
 [ -f "$OUT" ] || { echo "✗ compile failed — $OUT not produced"; exit 1; }
 
 # optional wasm-opt shrink (-g keeps the name section for trap symbolication)
